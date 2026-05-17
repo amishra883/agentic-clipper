@@ -109,54 +109,45 @@ Atlas Cloud is our Seedance 2.0 provider at $0.022/sec Fast — see `docs/seedan
 
 ## 6. Generate the manic_reactor reference image (~3 min, once #4 is done)
 
-The avatar's locked seed is `8376739915435003287` (`config/avatars/README.md`). The exact request payload is below — paste it into `curl` once you have your Atlas Cloud key.
+The avatar's locked seed is `8376739915435003287` (`config/avatars/README.md`). Run the script that submits the locked prompt + seed to Atlas Cloud's Seedream image API:
 
 ```bash
-# Set the key first
-export ATLAS_CLOUD_API_KEY=sk-...
+# Verify the dry-run prints expected payload (no network call, no spend)
+python3 scripts/generate_avatar.py --dry-run
 
-# Make the request. Atlas Cloud's image endpoint generates a single
-# static reference frame; we use it as the locked reference_image_url
-# for every avatar shot going forward.
-curl -X POST https://api.atlascloud.ai/v1/images/generations \
-  -H "Authorization: Bearer $ATLAS_CLOUD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "seedance-image-2.0",
-    "prompt": "A stylized cartoon character designed as a podcast/video reactor mascot. Friendly but unhinged energy. Big expressive eyes (cartoon-large, not anime), wide flexible mouth capable of exaggerated faces. Round-ish head, simple shape language, one signature accessory (a chunky pair of headphones around the neck). Bright primary palette, thick clean linework, modern flat-shaded animation style — think contemporary animated short, not 1990s Saturday morning. Front-facing, neutral pose, looking slightly off-camera, expression mid-grin. Plain neutral background. NOT a real person, NOT a celebrity, NOT based on any specific human likeness. Mascot quality.",
-    "seed": 8376739915435003287,
-    "aspect_ratio": "1:1",
-    "resolution": "1024x1024"
-  }' > /tmp/avatar_response.json
+# Run it for real (~3s generation, ~$0.032)
+python3 scripts/generate_avatar.py
+```
 
-# Inspect — if it's HTTP 200 with no image_url, the face-filter rejected
-# the prompt. (Shouldn't happen here — the prompt is explicitly non-photoreal —
-# but the Visuals agent handles this case in production.)
-cat /tmp/avatar_response.json
+The script:
 
-# Download the image to the locked path
-IMAGE_URL=$(jq -r '.image_url' /tmp/avatar_response.json)
-curl -o config/avatars/manic_reactor.png "$IMAGE_URL"
+1. Reads `ATLAS_CLOUD_API_KEY` from `.env` (or env).
+2. POSTs to `https://api.atlascloud.ai/api/v1/model/generateImage` with model `seedream-v5.0-lite`, the locked prompt, and seed `8376739915435003287`.
+3. Polls the prediction endpoint until status=`completed`.
+4. Downloads the result to `config/avatars/manic_reactor.png`.
+5. Writes provenance + cost rows to `data/main.db` (`seedance_generations`, `costs`).
 
-# Verify it looks right (open in any image viewer)
-ls -la config/avatars/manic_reactor.png
+**Verify the result before committing:**
 
-# Commit
+- Open `config/avatars/manic_reactor.png` in any image viewer.
+- Is it clearly cartoon-coded (NOT photoreal)?
+- Headphones-around-neck signature accessory visible?
+- Front-facing, mid-grin expression?
+- Plain neutral background?
+
+If it looks right:
+
+```bash
 git add config/avatars/manic_reactor.png
-git commit -m "Lock manic_reactor avatar reference image (seed 8376739915435003287)"
+git commit -m "Lock manic_reactor avatar reference image"
 git push
 ```
 
-**Verify the result before committing:**
-- Is it clearly cartoon-coded (not photoreal)?
-- Does it have the headphones-around-neck accessory?
-- Front-facing, mid-grin expression?
+If it does NOT look right, **do not** change the seed (`8376739915435003287` is final). Tweak the `PROMPT` constant in `scripts/generate_avatar.py` and re-run — the script overwrites `manic_reactor.png` each call. Once you're happy with the image, commit, and the seed stays locked forever after.
 
-If it doesn't look right, **do not** change the seed. Re-write the prompt slightly while keeping the seed locked, regenerate. Once the right image is in `config/avatars/manic_reactor.png`, every subsequent avatar shot will lock to it.
+**Why a script instead of `curl`:** Atlas Cloud's Seedream API is async — submit returns a prediction ID, you poll for completion, then download. Easier to wrap once than to type out three curl-and-jq incantations every time you want to iterate on the prompt. The script is also the basis for Phase 2's Visuals image-gen wiring.
 
-**If the response was an empty body (face-filter rejection):** the prompt accidentally implied a real person. Strip any name, real-place reference, or photoreal qualifier and retry.
-
-After commit, re-run `make doctor` — it should now show all-green.
+**If the request fails with an empty `outputs` array on a "completed" response:** that's the Seedance video API's face-filter rejection signature; per recent reporting Atlas Cloud's third-party version may not apply this filter at all on the image endpoint, but if it does, the prompt contains a real-person signal somewhere. Strip names, real places, photoreal qualifiers and re-run. After commit, re-run `make doctor` — the `avatar reference image` check should pass.
 
 ---
 

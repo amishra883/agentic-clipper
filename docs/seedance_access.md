@@ -9,6 +9,28 @@
 > escalates. Quarterly re-verification of commercial-use language is
 > mandatory and will be enforced via `make doctor` once Phase 1 ships.
 > Next due: 2026-08-14.
+>
+> **Revision 2026-05-14 (Step 6 research):** secondary reporting indicates
+> Atlas Cloud's third-party hosting of Seedance/Seedream may NOT enforce
+> the upstream "no real-person uploads" filter that ByteDance's own
+> platforms (Jimeng) apply. Phase 0.7 listed the upstream filter as a
+> compliance backstop — that backstop is unreliable on Atlas Cloud.
+>
+> **Operational consequence:** the `_rule_no_real_face_seedance_reference`
+> rule in `agents/compliance.py` is the SOLE enforcer of "no creator-face
+> references", not a defense-in-depth layer. The Visuals agent must
+> independently verify that no `first_frame_url` or reference-image
+> argument contains a real human face before submission — Atlas Cloud
+> will not refuse the request for us. Test coverage on this rule is
+> already in `tests/test_compliance.py::test_real_face_reference_blocks`.
+>
+> Re-verify Atlas Cloud's actual filter behavior on first paid use; if
+> they DO apply the filter, this revision can be reverted.
+>
+> Companion finding: Atlas Cloud also serves Seedream (ByteDance's image
+> sibling) at $0.032/image for v5.0 Lite. Used by `scripts/generate_avatar.py`
+> to produce the locked reference image — same API key, async submit +
+> poll pattern documented below.
 
 ## Decision
 
