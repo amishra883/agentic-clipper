@@ -24,7 +24,7 @@ Implications of the fair-use-only posture (load-bearing):
 | Item | Owner | When |
 |---|---|---|
 | Rename repo `datasciencecoursera` → `agentic-clipper` via GitHub web UI; run `git remote set-url origin <new-url>` | operator | before Phase 1 commits |
-| Submit TikTok Content Posting API audit application | operator | Phase 1 Day 1 (4–8 week lead) |
+| ~~Submit TikTok Content Posting API audit application~~ | ~~operator~~ | **Dropped 2026-05-14** — TikTok runs in manual mode (Publisher writes to drop dir; operator uploads via native app). Re-evaluate month 3. |
 | Create Facebook Page (needed by IG Graph API linkage) | operator | Phase 1 Day 1 |
 | Initialize Google Cloud project + YouTube Data API key | operator | Phase 1 Day 1 |
 | Provision Atlas Cloud account + fund $50 starter balance + API key | operator | Phase 1 Day 1 |

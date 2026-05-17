@@ -1,4 +1,4 @@
-.PHONY: help phase0 scout trending process publish digest optimize experiment rollback doctor test init-db visuals
+.PHONY: help phase0 scout trending process publish digest optimize experiment rollback doctor test init-db visuals tiktok-confirm
 
 help:
 	@echo "agentic-clipper — make targets"
@@ -14,6 +14,7 @@ help:
 	@echo "  optimize         run Optimizer manually"
 	@echo "  experiment NAME=<name>  open a new bandit experiment"
 	@echo "  rollback CHANGE_ID=<id>  manually roll back an auto-applied change"
+	@echo "  tiktok-confirm CLIP_ID=<id> POST_ID=<id>  mark a manually-uploaded TikTok as posted"
 	@echo "  phase0           (no-op; Phase 0 already complete — see docs/phase0_digest.md)"
 
 phase0:
@@ -64,3 +65,12 @@ ifndef CHANGE_ID
 	$(error "CHANGE_ID is required; usage: make rollback CHANGE_ID=<id>")
 endif
 	python3 scripts/rollback_change.py --change-id $(CHANGE_ID)
+
+tiktok-confirm:
+ifndef CLIP_ID
+	$(error "CLIP_ID is required; usage: make tiktok-confirm CLIP_ID=<id> POST_ID=<id>")
+endif
+ifndef POST_ID
+	$(error "POST_ID is required; usage: make tiktok-confirm CLIP_ID=<id> POST_ID=<id>")
+endif
+	python3 scripts/tiktok_confirm.py --clip-id $(CLIP_ID) --post-id $(POST_ID)

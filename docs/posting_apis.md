@@ -3,6 +3,12 @@
 > Captured 2026-05-14. Re-verify before pipeline scaffolding and quarterly thereafter.
 > Primary docs `developers.google.com`, `developers.tiktok.com`, and `developers.facebook.com` returned HTTP 403 to direct fetches from this environment, so secondary references are cited alongside primary doc URLs. The primary URLs are the authoritative source — re-verify them manually before the build phase.
 
+> ### Operator decision (2026-05-14): TikTok deferred to manual mode
+>
+> The operator chose **not** to submit the TikTok Content Posting API audit application on Day 1. Rationale: the audit is brutal for solo operators (4–8 weeks, high rejection rate), and automated TikTok uploads are widely reported as algorithmically suppressed. Instead, the pipeline runs TikTok in **manual mode**: Publisher produces the finished MP4 + caption + hashtags in `data/clips/output/manual_upload/tiktok/`, and the operator uploads via the native TikTok app each morning (~5 min/day). See `docs/runbook.md` Step 7 for the daily workflow.
+>
+> Re-evaluate at **month 3** once we have a track record to point at in the audit application. The TikTok section below is preserved as reference for that re-evaluation.
+
 ## Summary table
 
 | Platform           | API                          | Status                          | Approval needed                                                                                  | Daily limit                                                                          | Notes |

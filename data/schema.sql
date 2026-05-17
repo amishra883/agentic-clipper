@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS clips_ready (
   hook_template_id    TEXT,
   experiment_arm      TEXT,
   status              TEXT NOT NULL DEFAULT 'queued'
-                        CHECK (status IN ('queued','posting','posted','failed','cancelled')),
+                        CHECK (status IN ('queued','posting','manual_pending','posted','failed','cancelled')),
   posted_at           TEXT,
   platform_post_id    TEXT,
   failure_reason      TEXT,

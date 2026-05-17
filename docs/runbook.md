@@ -31,62 +31,15 @@ GitHub auto-redirects from the old URL, so anything else that references the rep
 
 ---
 
-## 2. TikTok Content Posting API audit (~10 min to submit; 4–8 wk review)
+## 2. TikTok — DEFERRED until month 3 *(operator decision 2026-05-14)*
 
-This is the **long pole**. Submit today.
+**You do not need to submit anything to TikTok today.** No developer account, no audit, no API setup.
 
-1. Go to **https://developers.tiktok.com/** and sign in (use the email tied to your Business/Creator TikTok identity, NOT a personal account).
-2. Click **Manage apps** → **Connect an app** (or **Create an app** if none exists).
-3. App-creation form — paste these answers:
+Why: TikTok's Content Posting API audit (4–8 weeks) is gated tightly against solo operators, automated-upload reach is widely reported as suppressed, and the rejection rate is high. We get all of TikTok's distribution upside today by uploading the finished MP4s manually each morning — the pipeline still produces them end-to-end (Compliance gate, AI commentary, generative visuals, captions burned in). See **Step 7** for the daily manual-upload playbook (~5 min/day).
 
-   | Field | Paste this |
-   |---|---|
-   | App name | `Agentic Clipper` |
-   | Category | `Content Creation Tools` |
-   | Description | `Short-form commentary/reaction video pipeline. Source clips ≤30s undergo AI-narrated commentary that occupies ≥50% of audio runtime. Each clip is transformative under U.S. fair-use (17 U.S.C. § 107). Publisher applies TikTok's AI-content label on every clip that uses generative visuals. Output ≤60s, vertical 9:16.` |
-   | Website URL | `https://agentic-clipper.dev` (placeholder — replace with your real domain when you provision it) |
-   | Privacy Policy URL | (host a one-pager describing data handling — template below) |
-   | Terms of Service URL | (host a one-pager — template below) |
+Re-evaluate at **month 3** once you have a track record to point at in an audit application — at that point the rejection cost is lower.
 
-4. After app creation, request the **Content Posting API** product:
-   - **Products → Add product → Content Posting API → Request**.
-   - You will need to request **"Direct Post"** scope explicitly. The default `SELF_ONLY` sandbox is useless for distribution.
-5. Audit submission form — paste these answers:
-
-   | Field | Paste this |
-   |---|---|
-   | Use case | `Autonomous publishing of transformative commentary clips to a TikTok account owned by the operator. Each posting decision is gated by our internal Compliance hard-gate which enforces fair-use rules (source ≤30s, commentary ≥50%, AI-content disclosure, attribution to source creator). No third-party user content is published.` |
-   | Posting frequency | `≤4 posts/day per account` |
-   | Content moderation approach | `Hard-gated by automated Compliance rules before any post call. Manual review on first 50 clips. Backup-account failover on first copyright claim.` |
-   | AI-content disclosure | `Every clip with AI-generated visuals or AI-narration is labeled via the platform's AI-content toggle on the upload call.` |
-   | Privacy / data handling | `No third-party user data collected. Source clip metadata cached locally in SQLite. No data sent to TikTok beyond the post payload itself.` |
-6. Submit. Save your **Client Key** and **Client Secret** to `.env`:
-   ```
-   TIKTOK_CLIENT_KEY=...
-   TIKTOK_CLIENT_SECRET=...
-   ```
-7. Audit review typically takes 4–8 weeks. While you wait, the codebase runs in TikTok's Playwright-on-TikTok-Studio-Desktop fallback mode (suppressed reach — see `docs/posting_apis.md`).
-
-**Privacy Policy / ToS one-pagers (host on your domain, both required for app submission):**
-
-Privacy Policy template:
-```
-agentic-clipper does not collect personal data from third parties. The
-operator's own platform credentials are stored locally and never transmitted
-to any service other than the platforms they authenticate against
-(YouTube, TikTok, Instagram). Source content metadata (URLs, view counts,
-public titles) is cached locally for analytics. No user is tracked.
-```
-
-ToS template:
-```
-agentic-clipper is operated solely by the named account holder. Content
-posted via this pipeline is transformative commentary on publicly-available
-source material under U.S. fair-use doctrine (17 U.S.C. § 107). All AI-
-generated visuals are labeled per platform requirements. The operator
-warrants that they comply with each platform's community guidelines and
-copyright policies.
-```
+**If you change your mind earlier**, the previous walkthrough lives in this file's git history (commit `4818d8d`). The fields and prompts there are still accurate.
 
 ---
 
@@ -207,14 +160,41 @@ After commit, re-run `make doctor` — it should now show all-green.
 
 ---
 
+## 7. Daily TikTok manual upload (~5 min/day, recurring)
+
+Replaces step 2's API automation. Each morning:
+
+1. Check `data/clips/output/manual_upload/tiktok/` for the previous day's finished MP4s.
+2. For each clip directory `<date>_<clip_id>/`, you'll find:
+   - `video.mp4` — the final composited clip
+   - `caption.txt` — the description (already Compliance-approved: includes attribution, "Commentary on...", AI-visuals disclosure, `#ad` if applicable)
+   - `hashtags.txt` — the hashtag set (3–5 tags per TikTok config)
+3. Open the TikTok mobile app or TikTok Studio Desktop.
+4. Tap **+** to upload → select the `video.mp4` from your phone (AirDrop / Google Drive / Dropbox the file over if you're uploading from the server).
+5. Paste `caption.txt` into the caption field, append `hashtags.txt`.
+6. **Toggle "AI-generated content"** ON if the clip used any Seedance visuals (required by TikTok ToS; Compliance already verified the description discloses this).
+7. Set posting time to match the slot it was scheduled for in `config/posting_schedule.yaml` (TikTok's "Schedule" feature accepts up to 10 days out).
+8. Post (or schedule). Then run:
+   ```bash
+   make tiktok-confirm CLIP_ID=<clip_id> POST_ID=<tiktok_post_id>
+   ```
+   This marks `clips_ready.status = 'posted'` and lets the Analyst pick it up after 48h.
+
+The pipeline produces ~3 TikTok-targeted clips/day per `config/posting_schedule.yaml`. Total daily time: 5–10 min.
+
+> *(The `make tiktok-confirm` target is wired in Phase 2 alongside live API publishers. For now, Publisher writes the files to `data/clips/output/manual_upload/tiktok/` and marks the queue row `manual_pending`.)*
+
+---
+
 ## Status checklist
 
-- [x] Step 1: Rename repo
-- [ ] Step 2: TikTok audit submitted *(long pole — submit today)*
+- [ ] Step 1: Rename repo
+- [x] ~~Step 2: TikTok audit~~ — *deferred to month 3 (see above); replaced by Step 7 daily upload*
 - [ ] Step 3a: Facebook Page created and linked to IG
 - [ ] Step 3b: Google Cloud project + YouTube API keys in `.env`
 - [ ] Step 4: Atlas Cloud account funded, key in `.env`
 - [x] Step 5: `make init-db && make test && make doctor` *(36/36 pass; 1 expected fail awaiting step 6)*
 - [ ] Step 6: Avatar reference image generated and committed
+- [ ] Step 7: (recurring) daily TikTok manual upload — kicks in once Phase 2 runs the pipeline end-to-end
 
-Once all boxes are ticked, **Phase 2** (replacing `NotImplementedError` stubs with live wiring) is unblocked.
+Once steps 1, 3a, 3b, 4, 6 are ticked, **Phase 2** (replacing `NotImplementedError` stubs with live wiring) is unblocked.

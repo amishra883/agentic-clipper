@@ -1,15 +1,26 @@
 """Publisher — flushes the publish queue, respecting the posting schedule.
 
 Reads `clips_ready` where status='queued' and scheduled_for <= now. Routes
-each row to its target platform (YouTube Data API v3, TikTok Content Posting
-API w/ Playwright fallback, Instagram Graph API). Builds the description from
-a template that includes:
+each row according to its target platform's `mode` in posting_schedule.yaml:
+
+  - mode='api'    → live upload via the platform's official API
+                    (YouTube Data API v3, Instagram Graph API)
+  - mode='manual' → write {video.mp4, caption.txt, hashtags.txt} into the
+                    platform's `manual_drop_directory` and set
+                    clips_ready.status = 'manual_pending'. Operator uploads
+                    via the native app, then runs:
+                      make tiktok-confirm CLIP_ID=<id> POST_ID=<id>
+                    which flips the row to 'posted' and records platform_post_id.
+                    Operator-decided 2026-05-14 for TikTok.
+
+Builds the description from a template that includes:
   - source creator name (attribution — fair-use Factor 1)
   - "commentary" / "reaction" marker (transformative-purpose disclosure)
   - "AI-generated visuals" disclosure if any generated assets were used
   - "#ad" disclosure if affiliate links are present
 
-Live API integrations are deferred to Phase 2.
+Live API integrations are deferred to Phase 2; the manual-mode drop path
+is also a Phase 2 stub (it currently sits as NotImplementedError below).
 
 Per CLAUDE.md "Architecture / Agent topology" — Publisher step 8.
 """

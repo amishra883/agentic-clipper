@@ -4,8 +4,23 @@
 
 timezone: America/New_York   # US Eastern per operator default
 
+# === Posting mode per platform (operator decision 2026-05-14) ===
+# - api:    Publisher uploads directly via the platform's official API.
+# - manual: Publisher writes the finished MP4 + caption + hashtags to a drop
+#           directory and marks the queue row 'manual_pending'. Operator
+#           uploads via the platform's native app/desktop client, then runs
+#           `make tiktok-confirm CLIP_ID=<id> POST_ID=<id>` (or platform-
+#           specific equivalent) to mark the row 'posted'. See docs/runbook.md
+#           Step 7 for the daily TikTok workflow.
+#
+# TikTok is manual because the Content Posting API audit is brutal (4-8wk,
+# high rejection for solo operators) and automated TikTok uploads are
+# widely reported as algorithmically suppressed. Re-evaluate at month 3.
+
 platforms:
   tiktok:
+    mode: manual
+    manual_drop_directory: data/clips/output/manual_upload/tiktok
     posts_per_day: 3
     times:
       - "07:00"
@@ -17,12 +32,14 @@ platforms:
       extra_time: "23:00"
 
   instagram_reels:
+    mode: api
     posts_per_day: 2
     times:
       - "11:00"
       - "19:00"
 
   youtube_shorts:
+    mode: api
     posts_per_day: 2
     times:
       - "12:00"
@@ -59,10 +76,9 @@ quota_guards:
     cost_per_upload_units: 1600
     max_uploads_per_day: 6        # 9600 units; leaves headroom for read calls
   tiktok:
-    api: tiktok_content_posting_api
-    mode_pre_audit: SELF_ONLY
-    max_uploads_per_day_pre_audit: 5
-    fallback: playwright_tiktok_studio_desktop
+    api: not_used   # operator chose manual mode 2026-05-14; see platforms.tiktok.mode above
+    manual_daily_cap: 4              # safety: never queue more than this for manual upload
+    fallback: none                   # no API fallback; manual is the production path
   instagram:
     api: instagram_graph_api
     daily_post_limit: 50          # current limit; queryable via content_publishing_limit
