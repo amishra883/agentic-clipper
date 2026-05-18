@@ -28,11 +28,19 @@ def init_schema(db_path: Path | None = None) -> None:
 
 @contextmanager
 def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
+    # Multiple pipeline agents (Scout, Curator, Visuals, Publisher) hit the same
+    # SQLite file concurrently. Without WAL the writers block readers; without
+    # busy_timeout concurrent writers get an immediate "database is locked"
+    # error. PRAGMA journal_mode is per-database (sticky) but PRAGMA
+    # foreign_keys + busy_timeout are per-connection, so set them every time.
     target = db_path or _db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target)
+    conn = sqlite3.connect(target, timeout=30.0, isolation_level="DEFERRED")
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")  # ms; matches sqlite3.connect timeout
+    conn.execute("PRAGMA synchronous = NORMAL")  # WAL-safe, faster than FULL
     try:
         yield conn
         conn.commit()

@@ -53,18 +53,24 @@ CREATE INDEX IF NOT EXISTS idx_candidates_score ON clips_candidate (virality_sco
 CREATE TABLE IF NOT EXISTS clip_artifacts (
   clip_id               TEXT PRIMARY KEY REFERENCES clips_candidate(id) ON DELETE CASCADE,
   source_local_path     TEXT,            -- yt-dlp download
-  punch_segment_start_s REAL,
-  punch_segment_end_s   REAL,
+  punch_segment_start_s REAL CHECK (punch_segment_start_s IS NULL OR punch_segment_start_s >= 0),
+  punch_segment_end_s   REAL CHECK (punch_segment_end_s   IS NULL OR punch_segment_end_s   >= 0),
   transcript_json       TEXT,            -- faster-whisper output
   script_text           TEXT,            -- Writer output
   shot_list_json        TEXT,            -- Writer shot list
   voice_audio_path      TEXT,            -- Voice output
-  voice_runtime_s       REAL,
-  visuals_seconds_used  REAL DEFAULT 0,
+  voice_runtime_s       REAL CHECK (voice_runtime_s IS NULL OR voice_runtime_s >= 0),
+  -- Compositor-level evidence of the two compliance gates that used to be
+  -- hardcoded to safe values. NULL = upstream did not check yet (treat as
+  -- unknown → fail closed in compliance). 0 = explicitly checked, no music /
+  -- no real face. 1 = music or real face detected.
+  has_music_in_source_segment      INTEGER CHECK (has_music_in_source_segment IN (0,1)),
+  has_real_face_reference          INTEGER CHECK (has_real_face_reference IN (0,1)),
+  visuals_seconds_used  REAL DEFAULT 0 CHECK (visuals_seconds_used >= 0),
   visuals_tier          TEXT CHECK (visuals_tier IN ('fast','pro','mixed')),
-  visuals_cost_usd      REAL DEFAULT 0,
+  visuals_cost_usd      REAL DEFAULT 0 CHECK (visuals_cost_usd >= 0),
   final_video_path      TEXT,            -- Compositor output
-  final_duration_s      REAL,
+  final_duration_s      REAL CHECK (final_duration_s IS NULL OR final_duration_s >= 0),
   updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -80,6 +86,10 @@ CREATE TABLE IF NOT EXISTS compliance_results (
   blocked_reason    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_compliance_clip ON compliance_results (clip_id);
+-- Index used by publisher.py's "latest compliance result per clip must pass"
+-- query. Without it the query degrades to O(N) per row at publish time.
+CREATE INDEX IF NOT EXISTS idx_compliance_clip_checked_at
+  ON compliance_results (clip_id, checked_at DESC);
 
 -- ============================================================
 -- Seedance generation log — provenance + cost audit
@@ -126,6 +136,11 @@ CREATE TABLE IF NOT EXISTS clips_ready (
   clip_id             TEXT NOT NULL REFERENCES clips_candidate(id),
   target_platform     TEXT NOT NULL CHECK (target_platform IN ('tiktok','instagram_reels','youtube_shorts')),
   account_id          TEXT NOT NULL,   -- which of our accounts (primary or backup)
+  -- scheduled_for is stored as ISO 8601 with explicit timezone offset
+  -- (e.g. 2026-05-17T07:00:00-04:00). publisher.py compares it against
+  -- the current UTC time via SQLite's datetime() conversion. Without an
+  -- offset the comparison is undefined and posts can fire hours early or
+  -- late under DST shifts. Writers MUST include the offset.
   scheduled_for       TEXT NOT NULL,
   title               TEXT,
   description         TEXT NOT NULL,   -- includes attribution + #ad if applicable + AI-content note
@@ -138,8 +153,14 @@ CREATE TABLE IF NOT EXISTS clips_ready (
   posted_at           TEXT,
   platform_post_id    TEXT,
   failure_reason      TEXT,
-  retry_count         INTEGER NOT NULL DEFAULT 0
+  retry_count         INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0)
 );
+-- One queued row per (clip, platform). Re-queuing a failed clip requires
+-- explicit status transition or row deletion — prevents duplicate posts
+-- from accidental re-curation.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ready_clip_platform_active
+  ON clips_ready (clip_id, target_platform)
+  WHERE status IN ('queued','posting','manual_pending');
 CREATE INDEX IF NOT EXISTS idx_ready_scheduled ON clips_ready (status, scheduled_for);
 CREATE INDEX IF NOT EXISTS idx_ready_account ON clips_ready (account_id);
 
@@ -180,14 +201,14 @@ CREATE TABLE IF NOT EXISTS performance_metrics (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   feature_record_id     INTEGER NOT NULL REFERENCES feature_records(id),
   pulled_at             TEXT NOT NULL DEFAULT (datetime('now')),
-  views                 INTEGER,
-  watch_time_pct        REAL,
-  likes                 INTEGER,
-  shares                INTEGER,
+  views                 INTEGER CHECK (views IS NULL OR views >= 0),
+  watch_time_pct        REAL    CHECK (watch_time_pct IS NULL OR (watch_time_pct >= 0 AND watch_time_pct <= 100)),
+  likes                 INTEGER CHECK (likes IS NULL OR likes >= 0),
+  shares                INTEGER CHECK (shares IS NULL OR shares >= 0),
   follows_gained        INTEGER,
-  click_throughs        INTEGER,
-  comments              INTEGER,
-  hours_since_post      REAL
+  click_throughs        INTEGER CHECK (click_throughs IS NULL OR click_throughs >= 0),
+  comments              INTEGER CHECK (comments IS NULL OR comments >= 0),
+  hours_since_post      REAL    CHECK (hours_since_post IS NULL OR hours_since_post >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_perf_feature ON performance_metrics (feature_record_id);
 
@@ -231,7 +252,7 @@ CREATE TABLE IF NOT EXISTS costs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   ts              TEXT NOT NULL DEFAULT (datetime('now')),
   category        TEXT NOT NULL,   -- matches keys in config/budget.yaml line_items
-  amount_usd      REAL NOT NULL,
+  amount_usd      REAL NOT NULL CHECK (amount_usd >= 0),
   clip_id         TEXT REFERENCES clips_candidate(id),
   provider        TEXT,
   detail          TEXT

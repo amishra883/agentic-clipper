@@ -73,6 +73,11 @@ class AudioTrack:
     runtime_s: float
     loudness_lufs: float
     engine: str                            # coqui_xtts_v2 | elevenlabs
+    # Persona's approved voice identifier (matches an entry in
+    # persona.yaml voice.approved_voice_ids). Compliance requires this to
+    # be both non-empty and a member of the active persona's whitelist —
+    # the structural guard against accidental source-creator cloning.
+    voice_id: str | None = None
 
 
 @dataclass
@@ -97,8 +102,12 @@ class CompositedClip:
     audio_track: AudioTrack
     visuals_used: list[GeneratedAsset]
     description: str
-    has_music_in_source_segment: bool
-    has_real_face_reference: bool
+    # True = detected (will fail compliance). False = explicitly checked and
+    # absent (passes). None = not yet checked (treated as unknown → fail
+    # closed in compliance). Compositor MUST NOT hardcode False; it reads
+    # the upstream evidence from clip_artifacts.
+    has_music_in_source_segment: bool | None
+    has_real_face_reference: bool | None
     source_creator: str                    # for attribution check
 
 
