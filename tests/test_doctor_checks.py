@@ -187,3 +187,97 @@ def test_account_warming_fails_with_only_one_warm_backup(doctor_db):
     results = doctor.check_account_warming()
     assert results[0].ok is False
     assert "warm_backups=1" in results[0].detail
+
+
+# ---------- _ping_https / check_live_apis ----------
+
+def _fake_urlopen_factory(status_code: int):
+    """Return a fake urlopen that yields a context manager with .status."""
+    class _FakeResp:
+        def __init__(self, code: int) -> None:
+            self.status = code
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def _fake(req, timeout=None):
+        return _FakeResp(status_code)
+    return _fake
+
+
+def test_ping_https_passes_on_2xx(monkeypatch):
+    """200/204 from the host means TLS + edge reachable."""
+    from scripts import doctor
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_factory(200))
+    ok, detail = doctor._ping_https("example.com")
+    assert ok is True
+    assert "HTTP 200" in detail
+
+
+def test_ping_https_passes_on_401(monkeypatch):
+    """401 = the request got to the API and got rejected for missing auth.
+    For a liveness check that's exactly what we want — the path the request
+    is taking is healthy, the auth simply isn't attached."""
+    from scripts import doctor
+    import urllib.request, urllib.error
+    def _raises_401(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", _raises_401)
+    ok, detail = doctor._ping_https("api.example.com")
+    assert ok is True
+    assert "HTTP 401" in detail
+
+
+def test_ping_https_fails_on_unexpected_5xx(monkeypatch):
+    """500 is not in the accept_status default; FAIL."""
+    from scripts import doctor
+    import urllib.request, urllib.error
+    def _raises_500(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 500, "Internal", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", _raises_500)
+    ok, detail = doctor._ping_https("api.example.com")
+    assert ok is False
+    assert "HTTP 500" in detail
+
+
+def test_ping_https_fails_on_network_error(monkeypatch):
+    """DNS / socket / TLS failures yield a network-error FAIL."""
+    from scripts import doctor
+    import urllib.request, socket
+    def _raises_gaierror(req, timeout=None):
+        raise socket.gaierror(8, "nodename nor servname provided")
+    monkeypatch.setattr(urllib.request, "urlopen", _raises_gaierror)
+    ok, detail = doctor._ping_https("nonexistent.invalid")
+    assert ok is False
+    assert "network error" in detail
+    assert "gaierror" in detail
+
+
+def test_check_live_apis_returns_five_results(monkeypatch):
+    """All five providers report (YouTube, Instagram, Atlas, fal.ai, TikTok-manual)."""
+    from scripts import doctor
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_factory(200))
+    results = doctor.check_live_apis()
+    names = [r.name for r in results]
+    assert any("YouTube" in n for n in names)
+    assert any("Instagram" in n for n in names)
+    assert any("Atlas Cloud" in n for n in names)
+    assert any("fal.ai" in n for n in names)
+    assert any("TikTok manual-mode" in n for n in names)
+    # TikTok manual-mode is always informational-pass; the rest are network-driven
+    tiktok = next(r for r in results if "TikTok" in r.name)
+    assert tiktok.ok is True
+
+
+def test_check_live_apis_marks_unreachable_as_fail(monkeypatch):
+    """If every HEAD raises a network error, four of the five fail (TikTok
+    manual-mode stays informational-pass)."""
+    from scripts import doctor
+    import urllib.request, socket
+    def _always_fails(req, timeout=None):
+        raise socket.gaierror(8, "DNS lookup failed")
+    monkeypatch.setattr(urllib.request, "urlopen", _always_fails)
+    results = doctor.check_live_apis()
+    failed = [r for r in results if not r.ok]
+    assert len(failed) == 4  # YouTube, Instagram, Atlas, fal.ai
+    assert all("network error" in r.detail for r in failed)
