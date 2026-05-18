@@ -47,8 +47,15 @@ PREDICTION_ENDPOINT = f"{ATLAS_BASE}/model/prediction"
 LOCKED_SEED = 8376739915435003287
 
 # Cheapest Seedream variant on Atlas Cloud ($0.032/image, native 1-3s generation).
-# Override with --model if you want higher fidelity (v4.5 at $0.036).
-DEFAULT_MODEL = "seedream-v5.0-lite"
+# Atlas's catalog requires the provider prefix in the model id.
+DEFAULT_MODEL = "bytedance/seedream-v5.0-lite"
+
+# Atlas Cloud sits behind Cloudflare; urllib's default "Python-urllib/X.Y"
+# User-Agent gets blocked with HTTP 403 (CF error 1010). Send a browser-like UA.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
 
 # Mirrors the prompt locked in config/avatars/README.md.
 PROMPT = (
@@ -70,7 +77,7 @@ COST_PER_IMAGE_USD = 0.032
 # ---------- HTTP helpers (stdlib only — no requests dependency) ----------
 
 def _request(method: str, url: str, *, api_key: str | None = None, body: dict | None = None, timeout: int = 30) -> tuple[int, bytes]:
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -83,7 +90,8 @@ def _request(method: str, url: str, *, api_key: str | None = None, body: dict | 
 
 
 def _get_bytes(url: str, timeout: int = 60) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
