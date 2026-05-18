@@ -53,19 +53,33 @@ def _rule_commentary_at_least_50pct(clip: CompositedClip) -> tuple[bool, str]:
 
 
 def _rule_no_music_in_source(clip: CompositedClip) -> tuple[bool, str]:
-    ok = clip.has_music_in_source_segment is False
-    return ok, (
-        "music_detected=False" if ok
-        else "music_detected=True — must mute or replace before re-submission"
+    # Tri-state: False (explicitly checked, no music) passes; True (detected)
+    # blocks; None (not yet checked) fails CLOSED. Compositor used to hardcode
+    # False here, masking the absence of a real detector.
+    val = clip.has_music_in_source_segment
+    if val is False:
+        return True, "music_detected=False (verified by upstream stage)"
+    if val is True:
+        return False, "music_detected=True — must mute or replace before re-submission"
+    return False, (
+        "music_detected=unknown — upstream music detection not wired; "
+        "compositor must populate clip_artifacts.has_music_in_source_segment"
     )
 
 
 def _rule_no_real_face_seedance_reference(clip: CompositedClip) -> tuple[bool, str]:
-    ok = clip.has_real_face_reference is False
-    return ok, (
-        "real_face_reference=False" if ok
-        else "real_face_reference=True — Seedance reference image must be "
-             "non-human-real (cartoon-coded avatar only)"
+    # Tri-state, same as music rule. None → fail closed.
+    val = clip.has_real_face_reference
+    if val is False:
+        return True, "real_face_reference=False (verified by upstream stage)"
+    if val is True:
+        return False, (
+            "real_face_reference=True — Seedance reference image must be "
+            "non-human-real (cartoon-coded avatar only)"
+        )
+    return False, (
+        "real_face_reference=unknown — visuals stage must populate "
+        "clip_artifacts.has_real_face_reference"
     )
 
 
@@ -113,17 +127,61 @@ def _rule_ai_content_label(clip: CompositedClip) -> tuple[bool, str]:
     return ok, f"generated_visuals_present=True, ai_markers_found={found}"
 
 
-def _rule_no_voice_clone_of_source_creator(clip: CompositedClip) -> tuple[bool, str]:
-    """We only support neutral AI personas. The audio track's engine field is
-    informational. The structural check: voice engine is Coqui or ElevenLabs
-    on an approved-persona voice ID — never a cloned-from-source voice.
-    This rule is a placeholder that asserts the engine field is set; the
-    deeper "is this a source-creator clone" check belongs in the Voice agent
-    itself (which is the only stage that could introduce such a clone).
+_APPROVED_ENGINES = {"coqui_xtts_v2", "elevenlabs"}
+
+
+def _approved_voice_ids_for_active_persona() -> set[str]:
+    """Load the active persona's voice whitelist from config/persona.yaml.
+
+    Empty set means no voice was ever approved — fail closed. Errors loading
+    the config also fail closed (no clip ships if the gate config is broken).
     """
-    engine = (clip.audio_track.engine or "").lower() if clip.audio_track else ""
-    ok = engine in {"coqui_xtts_v2", "elevenlabs"}
-    return ok, f"voice_engine='{engine}'"
+    try:
+        from agents.config import load  # local import to keep compliance importable in tests
+        cfg = load("persona")
+        active = cfg.get("active_persona")
+        for p in cfg.get("personas", []):
+            if p.get("id") == active:
+                ids = (p.get("voice") or {}).get("approved_voice_ids") or []
+                return {str(v) for v in ids if v}
+    except Exception:
+        return set()
+    return set()
+
+
+def _rule_no_voice_clone_of_source_creator(clip: CompositedClip) -> tuple[bool, str]:
+    """Block any voice that isn't in the persona's whitelist.
+
+    Two-layer structural check:
+      1. Engine must be one of the approved TTS engines (coqui_xtts_v2 or
+         elevenlabs). Rejects a hypothetical "cloned_from_source" engine tag.
+      2. voice_id must be a non-empty member of the active persona's
+         approved_voice_ids whitelist in persona.yaml. An ElevenLabs voice
+         trained on a source creator would not appear there and is blocked.
+    """
+    if not clip.audio_track:
+        return False, "audio_track missing"
+    engine = (clip.audio_track.engine or "").lower()
+    if engine not in _APPROVED_ENGINES:
+        return False, f"voice_engine='{engine}' not in approved set {_APPROVED_ENGINES}"
+    voice_id = (clip.audio_track.voice_id or "").strip()
+    if not voice_id:
+        return False, (
+            "voice_id missing — Voice stage must set AudioTrack.voice_id to a "
+            "value in persona.yaml voice.approved_voice_ids"
+        )
+    approved = _approved_voice_ids_for_active_persona()
+    if not approved:
+        return False, (
+            "active persona has empty approved_voice_ids — fail closed; add "
+            "voice IDs to persona.yaml deliberately"
+        )
+    if voice_id not in approved:
+        return False, (
+            f"voice_id='{voice_id}' not in active persona's approved_voice_ids — "
+            "possible source-creator clone or misconfigured Voice stage"
+        )
+    return True, f"voice_engine='{engine}', voice_id='{voice_id}' (whitelisted)"
 
 
 def _rule_finite_durations(clip: CompositedClip) -> tuple[bool, str]:

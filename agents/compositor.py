@@ -109,6 +109,11 @@ async def run_compositor(clip_id: str) -> CompositedClip:
         runtime_s=voice_runtime,
         loudness_lufs=-14.0,
         engine="coqui_xtts_v2",
+        # Phase 1 scaffold uses the placeholder voice_id. Phase 2's Voice
+        # agent must set this from the persona-resolved choice (a member of
+        # persona.yaml voice.approved_voice_ids); a missing or unapproved
+        # value fails the no_voice_clone compliance rule.
+        voice_id="phase1_scaffold_voice",
     )
 
     visuals: list[GeneratedAsset] = []  # Phase 1 has no generated assets yet
@@ -135,6 +140,15 @@ async def run_compositor(clip_id: str) -> CompositedClip:
 
     _persist_composition(clip_id, str(dest_path), final_duration)
 
+    # Pull tri-state compliance evidence from clip_artifacts. The columns are
+    # populated by the Editor (music detection) and Visuals (real-face check)
+    # stages; if either is unwired the column stays NULL and Compliance fails
+    # closed downstream. Compositor must NEVER assert these values itself.
+    def _tri(v: object) -> bool | None:
+        if v is None:
+            return None
+        return bool(v)
+
     composited = CompositedClip(
         clip_id=clip_id,
         final_video_path=str(dest_path),
@@ -144,8 +158,8 @@ async def run_compositor(clip_id: str) -> CompositedClip:
         audio_track=voice_track,
         visuals_used=visuals,
         description="",  # Publisher fills the description from its template
-        has_music_in_source_segment=False,
-        has_real_face_reference=False,
+        has_music_in_source_segment=_tri(artifact.get("has_music_in_source_segment")),
+        has_real_face_reference=_tri(artifact.get("has_real_face_reference")),
         source_creator=creator,
     )
 

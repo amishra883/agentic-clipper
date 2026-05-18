@@ -22,6 +22,16 @@ personas:
       pitch_range: wide          # exaggerated highs/lows
       speaking_rate: fast        # ~180-220 wpm target
       breath_naturalness: medium # don't over-smooth; some chaos is on-brand
+      # Whitelist of voice IDs allowed for THIS persona. Compliance gate
+      # requires AudioTrack.voice_id to be a non-empty member of this list —
+      # the structural guard against accidental source-creator voice cloning
+      # (an ElevenLabs custom voice trained on a creator's audio would NOT
+      # appear here and would be blocked). Add IDs deliberately; this is the
+      # only configured chokepoint that distinguishes "neutral AI persona"
+      # from "voice clone of a real person".
+      approved_voice_ids:
+        - manic_reactor_coqui_default_v1     # Phase 1 default — locally-trained Coqui XTTS-v2 voice
+        - phase1_scaffold_voice               # Phase 1 placeholder; remove before any live run
 
     energy_floor:
       description: >

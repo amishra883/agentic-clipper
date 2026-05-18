@@ -119,6 +119,47 @@ def test_elevenlabs_voice_engine_passes(good_clip, good_audio_track):
     assert result.rule_results["no_voice_clone_of_source_creator"]["passed"] is True
 
 
+def test_unknown_music_evidence_fails_closed(good_clip):
+    """Compositor used to hardcode has_music_in_source_segment=False, which
+    masked the absence of a real music detector. Tri-state evidence must fail
+    closed when the upstream stage has not actually checked."""
+    clip = replace(good_clip, has_music_in_source_segment=None)
+    result = compliance.evaluate(clip)
+    assert result.passed is False
+    assert result.rule_results["no_music_in_source_segment"]["passed"] is False
+    assert "unknown" in result.rule_results["no_music_in_source_segment"]["detail"]
+
+
+def test_unknown_real_face_evidence_fails_closed(good_clip):
+    clip = replace(good_clip, has_real_face_reference=None)
+    result = compliance.evaluate(clip)
+    assert result.passed is False
+    assert result.rule_results["no_real_face_seedance_reference"]["passed"] is False
+    assert "unknown" in result.rule_results["no_real_face_seedance_reference"]["detail"]
+
+
+def test_missing_voice_id_blocks(good_clip, good_audio_track):
+    """A missing AudioTrack.voice_id is treated as unconfigured Voice stage —
+    fail closed, since an empty value can't prove "not a source-creator clone"."""
+    bad_audio = replace(good_audio_track, voice_id=None)
+    clip = replace(good_clip, audio_track=bad_audio)
+    result = compliance.evaluate(clip)
+    assert result.passed is False
+    assert result.rule_results["no_voice_clone_of_source_creator"]["passed"] is False
+
+
+def test_unapproved_voice_id_blocks(good_clip, good_audio_track):
+    """voice_id outside the active persona's approved_voice_ids whitelist
+    blocks. This is the structural guard against an ElevenLabs custom voice
+    trained on a source creator slipping through (because its ID would never
+    be in the whitelist)."""
+    bad_audio = replace(good_audio_track, voice_id="ishowspeed_clone_v1")
+    clip = replace(good_clip, audio_track=bad_audio)
+    result = compliance.evaluate(clip)
+    assert result.passed is False
+    assert result.rule_results["no_voice_clone_of_source_creator"]["passed"] is False
+
+
 # ---------- Attribution + transformative purpose ----------
 
 def test_missing_attribution_blocks(good_clip):

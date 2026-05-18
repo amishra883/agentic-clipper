@@ -40,6 +40,9 @@ def good_audio_track() -> AudioTrack:
         runtime_s=30.0,
         loudness_lufs=-14.0,
         engine="coqui_xtts_v2",
+        # Must match an entry in persona.yaml active persona's
+        # voice.approved_voice_ids. Compliance gate fails closed otherwise.
+        voice_id="manic_reactor_coqui_default_v1",
     )
 
 
