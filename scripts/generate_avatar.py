@@ -41,6 +41,15 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Make `from agents.db import connect` work when this file is run as
+# `python3 scripts/generate_avatar.py`. Python normally only adds the
+# script's directory (scripts/) to sys.path, so the agents package wasn't
+# importable and the audit-row write silently no-op'd with a misleading
+# "DB isn't initialized" message. Inserting at index 0 ensures repo root
+# takes precedence over any site-packages collision.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 AVATAR_PATH = REPO_ROOT / "config" / "avatars" / "manic_reactor.jpg"
 
 # Magic-byte prefixes for the two image formats Atlas Cloud might return.
@@ -235,6 +244,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Atlas Cloud model id (default: {DEFAULT_MODEL})")
     parser.add_argument("--dry-run", action="store_true", help="Print payload, do not call the network")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite the existing avatar reference image. Default behavior "
+            "is to refuse-if-exists so a stray re-run does not silently spend "
+            "$0.032 and break the locked-image contract."
+        ),
+    )
     args = parser.parse_args()
 
     print("=== Generate manic_reactor avatar ===")
@@ -245,9 +263,30 @@ def main() -> int:
     print(f"  prompt:      {PROMPT[:120]}...")
     print()
 
+    # --dry-run is always safe (no network call, no filesystem write), so it
+    # short-circuits both the idempotency guard and the API-key load.
     if args.dry_run:
         print("(--dry-run) no network call made. Re-run without --dry-run to generate.")
         return 0
+
+    # Idempotency guard: refuse to overwrite a locked reference image without
+    # explicit --force. Once committed, this image is the canonical mascot —
+    # silent regeneration breaks brand continuity AND costs $0.032 per accident.
+    # Per config/avatars/README.md "Changing the avatar later", a deliberate
+    # change should go through a /proposals/ review, not a script re-run.
+    if AVATAR_PATH.exists() and not args.force:
+        existing_size = AVATAR_PATH.stat().st_size
+        print(
+            f"ERROR: {AVATAR_PATH.relative_to(REPO_ROOT)} already exists "
+            f"({existing_size:,} bytes).\n"
+            "  Refusing to overwrite a locked reference image without --force.\n"
+            "  If you really want to regenerate (and accept the brand-continuity\n"
+            "  break documented in config/avatars/README.md):\n"
+            "    python3 scripts/generate_avatar.py --force\n"
+            "  If you instead want to commit the existing file as the lock:\n"
+            "    git add config/avatars/manic_reactor.jpg && git commit"
+        )
+        return 1
 
     api_key = load_api_key()
 
