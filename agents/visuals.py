@@ -119,6 +119,31 @@ def _month_to_date_pro_spend() -> float:
     return float(row["spend"])
 
 
+def _month_to_date_fast_spend() -> float:
+    """Aggregate spend on Seedance fast-tier this calendar month.
+
+    Used to enforce config/budget.yaml line_items.seedance_fast.monthly_budget_usd
+    — the missing aggregation Codex flagged: per-clip caps alone allow ~$105/mo
+    against a $50 line item at 7 clips/day. The line-item-vs-MTD check below
+    fails-closed (quarantines) before a generation that would push over.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(cost_usd), 0) AS spend FROM seedance_generations
+             WHERE tier = 'fast' AND status = 'succeeded'
+               AND strftime('%Y-%m', ts) = strftime('%Y-%m', 'now')
+            """
+        ).fetchone()
+    return float(row["spend"])
+
+
+def _line_item_budget(budget_cfg: dict, line_item: str) -> float:
+    return float(((budget_cfg.get("line_items") or {})
+                  .get(line_item) or {})
+                 .get("monthly_budget_usd", 0))
+
+
 def _eligible_for_pro(shot: ShotListEntry, *, curator_score: float | None,
                      predicted_views: int | None, budget_cfg: dict) -> bool:
     gates = budget_cfg["pro_tier_promotion"]
@@ -285,6 +310,33 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
 
         # Successful generation (Phase 2 wiring would populate these fields).
         cost = float(response.get("cost_usd", 0.0))
+
+        # Month-to-date line-item budget enforcement (Codex P1 fix). Fast and
+        # pro tiers have separate budgets in config/budget.yaml; the per-clip
+        # cap above doesn't aggregate across clips. Fail-closed if this
+        # generation would push the month over the line-item budget.
+        line_item = f"seedance_{chosen_tier}"
+        mtd_spend = (_month_to_date_pro_spend() if chosen_tier == "pro"
+                     else _month_to_date_fast_spend())
+        line_budget = _line_item_budget(budget_cfg, line_item)
+        if line_budget > 0 and mtd_spend + cost > line_budget:
+            _quarantine_clip(
+                clip_id,
+                f"monthly line-item budget exceeded for {line_item}: "
+                f"MTD=${mtd_spend:.2f} + ${cost:.2f} > ${line_budget:.2f}",
+            )
+            log(agent="visuals", event_type="cap_exceeded", level="blocked",
+                clip_id=clip_id,
+                payload={"cap": f"{line_item}.monthly_budget_usd",
+                         "limit": line_budget,
+                         "mtd_spend": mtd_spend,
+                         "attempted_increment": cost},
+                rationale=(
+                    f"month-to-date {line_item} would exceed line item; "
+                    "clip routed to /data/quarantine/"
+                ))
+            return assets
+
         if total_cost + cost > cost_cap:
             _quarantine_clip(clip_id, f"visuals cost cap ${cost_cap} would be exceeded")
             log(agent="visuals", event_type="cap_exceeded", level="blocked",

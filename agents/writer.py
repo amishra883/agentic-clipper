@@ -22,6 +22,35 @@ from agents.models import Script, ShotListEntry
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRENDING_PATH = REPO_ROOT / "data" / "trending.md"
+QUARANTINE_DIR = REPO_ROOT / "data" / "quarantine"
+
+
+class WriterPolicyError(Exception):
+    """Raised when a generated script violates a hard persona policy.
+
+    The caller (pipeline orchestrator) catches this and skips the clip;
+    the writer has already marked the clips_candidate row 'quarantined'
+    and written a marker file to /data/quarantine/.
+    """
+
+    def __init__(self, *, clip_id: str, violations: list[str]) -> None:
+        super().__init__(f"writer policy violations for {clip_id}: {', '.join(violations)}")
+        self.clip_id = clip_id
+        self.violations = violations
+
+
+def _quarantine_clip(clip_id: str, violations: list[str]) -> None:
+    """Mirror the visuals.py quarantine pattern: write a reason file and flip
+    clips_candidate.status to 'quarantined' so the row is visible in the
+    daily digest and not picked up by downstream stages."""
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    marker = QUARANTINE_DIR / f"{clip_id}.writer.reason.txt"
+    marker.write_text("writer hard violations: " + "; ".join(violations))
+    with connect() as conn:
+        conn.execute(
+            "UPDATE clips_candidate SET status = 'quarantined' WHERE id = ?",
+            (clip_id,),
+        )
 
 
 # ---------- LLM stubs ----------
@@ -212,6 +241,10 @@ async def run_writer(clip_id: str) -> Script:
         script = _placeholder_script(persona)
 
     violations = _validate_script(script, persona)
+
+    # Soft violation — punch_density below floor triggers a Phase 2 rewrite
+    # loop. The script is still persisted but flagged so the rewrite loop
+    # (when wired) can replace it.
     if "punch_density_below_floor" in violations:
         log(
             agent="writer",
@@ -223,6 +256,31 @@ async def run_writer(clip_id: str) -> Script:
             rationale="punch density below persona floor — rewrite required",
         )
         # TODO(phase2): loop into _llm_generate_script with a "denser" prompt.
+
+    # Hard violations — substance/trending gaps and persona do_not hits make
+    # the script non-shippable on fair-use grounds (substance keeps the clip
+    # transformative; do_not entries are the defamation / harassment / "no
+    # voice clone" guardrails from persona.yaml). Quarantine the clip rather
+    # than persist a known-bad script and rely on downstream stages to
+    # somehow recover. Compliance has no visibility into the script text so
+    # it cannot catch these — Writer is the only chokepoint.
+    SOFT_VIOLATIONS = {"punch_density_below_floor"}
+    hard_violations = [v for v in violations if v not in SOFT_VIOLATIONS]
+    if hard_violations:
+        _quarantine_clip(clip_id, hard_violations)
+        log(
+            agent="writer",
+            event_type="script_blocked",
+            level="blocked",
+            clip_id=clip_id,
+            payload={"violations": hard_violations,
+                     "soft_violations": [v for v in violations if v in SOFT_VIOLATIONS]},
+            rationale=(
+                "writer hard violations — clip routed to /data/quarantine/: "
+                + "; ".join(hard_violations)
+            ),
+        )
+        raise WriterPolicyError(clip_id=clip_id, violations=hard_violations)
 
     if violations:
         log(

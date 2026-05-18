@@ -194,14 +194,155 @@ def check_budget_cap() -> list[CheckResult]:
 
 def check_live_apis_stub() -> list[CheckResult]:
     """Live API pings (YouTube, TikTok, Instagram, Atlas Cloud, fal.ai) are
-    NotImplementedError in Phase 1. Surface them in the report so the operator
-    sees what's still ahead.
+    NotImplementedError in Phase 1. Each gets its own FAIL line so the
+    operator sees the actual unwired surface — the prior single-line OK
+    masked five separate Phase 2 gaps.
     """
+    providers = [
+        ("YouTube Data API v3 reachable", "POST videos.insert not yet wired (Phase 2)"),
+        ("TikTok manual-mode drop path", "manual_drop_directory writer wired; live API intentionally not used (operator-decided)"),
+        ("Instagram Graph API reachable", "Reels publish two-step not yet wired (Phase 2)"),
+        ("Atlas Cloud Seedance video API", "POST /v1/models/bytedance/seedance-2.0-* not yet wired (Phase 2)"),
+        ("fal.ai Seedance fallback", "failover provider not yet wired (Phase 2)"),
+    ]
+    out: list[CheckResult] = []
+    for name, detail in providers:
+        # TikTok is intentionally manual per operator decision (2026-05-14);
+        # its drop-path writer is wired in publisher.py, so report OK.
+        ok = "manual-mode" in name
+        out.append(CheckResult(name, ok, detail))
+    return out
+
+
+def check_monthly_budget_burn() -> list[CheckResult]:
+    """Compare month-to-date external spend (from the costs table) against
+    monthly_cap_usd and hard_kill_switch_usd in config/budget.yaml.
+
+    Codex P1 finding: per-clip caps don't prevent monthly burn. This check
+    enforces the aggregate.
+    """
+    try:
+        with (REPO_ROOT / "config" / "budget.yaml").open() as fh:
+            cfg = yaml.safe_load(fh)
+        cap = float(cfg.get("monthly_cap_usd", 0))
+        kill = float(cfg.get("hard_kill_switch_usd", cap))
+    except Exception as exc:
+        return [CheckResult("monthly budget burn", False, f"config/budget.yaml unreadable: {exc}")]
+
+    db_path = Path(os.environ.get("AGENTIC_CLIPPER_DB", REPO_ROOT / "data" / "main.db"))
+    if not db_path.exists():
+        return [CheckResult(
+            "monthly budget burn",
+            False,
+            "data/main.db missing — run `make init-db`; no spend ledger available",
+        )]
+
+    import sqlite3
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount_usd), 0) AS spend FROM costs "
+                "WHERE strftime('%Y-%m', ts) = strftime('%Y-%m', 'now')"
+            ).fetchone()
+        spend = float(row[0])
+    except Exception as exc:
+        return [CheckResult("monthly budget burn", False, f"DB query failed: {exc}")]
+
+    pct = (spend / cap * 100) if cap > 0 else 0
+    if spend >= kill:
+        return [CheckResult(
+            "monthly budget burn",
+            False,
+            f"OVER hard_kill_switch — ${spend:.2f} >= ${kill:.2f}; pipeline MUST be paused",
+        )]
+    if spend >= cap:
+        return [CheckResult(
+            "monthly budget burn",
+            False,
+            f"OVER cap — ${spend:.2f} / ${cap:.2f} ({pct:.0f}%); Optimizer should be auto-pausing line items",
+        )]
+    if pct >= 85:
+        return [CheckResult(
+            "monthly budget burn",
+            False,
+            f"approaching cap — ${spend:.2f} / ${cap:.2f} ({pct:.0f}%); review burn rate",
+        )]
     return [CheckResult(
-        "live API health checks",
+        "monthly budget burn",
         True,
-        "Phase 2 — YouTube / TikTok / Instagram / Atlas Cloud pings not yet wired",
+        f"${spend:.2f} / ${cap:.2f} ({pct:.0f}%); headroom OK",
     )]
+
+
+def check_strike_monitor() -> list[CheckResult]:
+    """Per CLAUDE.md "Zero copyright strikes tolerated" — any unresolved strike
+    is a FAIL regardless of count.
+    """
+    db_path = Path(os.environ.get("AGENTIC_CLIPPER_DB", REPO_ROOT / "data" / "main.db"))
+    if not db_path.exists():
+        return [CheckResult(
+            "strike monitor",
+            False,
+            "data/main.db missing — run `make init-db`; cannot verify zero-strike posture",
+        )]
+    import sqlite3
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM strikes WHERE resolved = 0"
+            ).fetchone()
+        n = int(row[0])
+    except Exception as exc:
+        return [CheckResult("strike monitor", False, f"DB query failed: {exc}")]
+    if n > 0:
+        return [CheckResult(
+            "strike monitor",
+            False,
+            f"{n} unresolved strike(s) — review accounts and dispute / failover before next publish",
+        )]
+    return [CheckResult("strike monitor", True, "0 unresolved strikes")]
+
+
+def check_account_warming() -> list[CheckResult]:
+    """Per spec: maintain 2 warm backup accounts per platform aged >=30d.
+    Failing the check means failover is unsafe."""
+    db_path = Path(os.environ.get("AGENTIC_CLIPPER_DB", REPO_ROOT / "data" / "main.db"))
+    if not db_path.exists():
+        return [CheckResult(
+            "account warming",
+            False,
+            "data/main.db missing — run `make init-db`; cannot verify warm-backup count",
+        )]
+    import sqlite3
+    out: list[CheckResult] = []
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT platform,
+                       SUM(CASE WHEN role='primary' AND active=1 THEN 1 ELSE 0 END) AS primaries,
+                       SUM(CASE WHEN role='backup_warm' AND warm_eligible=1 THEN 1 ELSE 0 END) AS warm_backups
+                  FROM accounts
+                 GROUP BY platform
+                """
+            ).fetchall()
+    except Exception as exc:
+        return [CheckResult("account warming", False, f"DB query failed: {exc}")]
+
+    if not rows:
+        return [CheckResult(
+            "account warming",
+            False,
+            "no rows in accounts table — register accounts before any publish",
+        )]
+    for platform, primaries, warm_backups in rows:
+        ok = (primaries or 0) >= 1 and (warm_backups or 0) >= 2
+        out.append(CheckResult(
+            f"account warming ({platform})",
+            ok,
+            f"primary={primaries or 0}, warm_backups={warm_backups or 0} (need primary>=1, warm_backups>=2)",
+        ))
+    return out
 
 
 CHECKS = [
@@ -213,6 +354,9 @@ CHECKS = [
     check_avatar_reference_image,
     check_quarterly_reverify,
     check_budget_cap,
+    check_monthly_budget_burn,
+    check_strike_monitor,
+    check_account_warming,
     check_live_apis_stub,
 ]
 

@@ -1,21 +1,28 @@
-.PHONY: help phase0 scout trending process publish digest optimize experiment rollback doctor test init-db visuals tiktok-confirm
+.PHONY: help phase0 init-db test doctor publish visuals \
+        scout trending process digest optimize experiment rollback tiktok-confirm
+
+# === Active targets (work today) ============================================
 
 help:
 	@echo "agentic-clipper — make targets"
+	@echo ""
+	@echo "Active:"
 	@echo "  init-db          create data/main.db from data/schema.sql"
 	@echo "  test             run pytest"
 	@echo "  doctor           health-check APIs, budget, strikes, warming, providers"
+	@echo "  publish          flush ready queue, respecting schedule (CLI wired)"
+	@echo "  phase0           (no-op; Phase 0 already complete — see docs/phase0_digest.md)"
+	@echo ""
+	@echo "Phase 2 stubs (target prints 'not yet wired' and exits 1):"
 	@echo "  scout            run Scout once"
-	@echo "  trending         refresh /data/trending.md from all sources"
+	@echo "  trending         refresh data/trending.md"
 	@echo "  process N=5      run full pipeline on next N candidates"
-	@echo "  visuals CLIP_ID=<id>  re-run only the Visuals stage for a clip"
-	@echo "  publish          flush ready queue, respecting schedule"
+	@echo "  visuals CLIP_ID=<id>  re-run only Visuals stage"
 	@echo "  digest           produce today's human digest"
 	@echo "  optimize         run Optimizer manually"
-	@echo "  experiment NAME=<name>  open a new bandit experiment"
-	@echo "  rollback CHANGE_ID=<id>  manually roll back an auto-applied change"
-	@echo "  tiktok-confirm CLIP_ID=<id> POST_ID=<id>  mark a manually-uploaded TikTok as posted"
-	@echo "  phase0           (no-op; Phase 0 already complete — see docs/phase0_digest.md)"
+	@echo "  experiment NAME=<name>     open a bandit experiment"
+	@echo "  rollback CHANGE_ID=<id>    roll back an auto-applied change"
+	@echo "  tiktok-confirm CLIP_ID=<id> POST_ID=<id>  flip manual_pending → posted"
 
 phase0:
 	@echo "Phase 0 is complete. See docs/phase0_digest.md for the human approval digest."
@@ -29,42 +36,56 @@ test:
 doctor:
 	python3 scripts/doctor.py
 
+# Publisher has an `if __name__ == "__main__":` block that runs run_publisher
+# under asyncio. Manual-mode platforms (TikTok) write to their drop directory;
+# api-mode platforms hit Phase 2 NotImplementedError stubs and the row is
+# marked failed for later retry.
+publish:
+	python3 -m agents.publisher
+
+# === Phase 2 stubs (intentionally fail loudly) ==============================
+# Each target below references a script or module CLI that is not yet wired.
+# Codex challenge 2026-05-17 flagged that the prior Makefile pointed at
+# nonexistent scripts (`scripts/refresh_trending.py` etc.) and at module CLIs
+# that have no `if __name__ == "__main__":`. Rather than silently failing
+# with cryptic "No such file or directory" errors, each target now prints
+# a clear "Phase 2 not yet wired" message and exits 1.
+
+_PHASE2_NOT_WIRED = @echo "Phase 2 NOT YET WIRED: $@. See docs/runbook.md for Phase 2 plan."; exit 1
+
 scout:
-	python3 -m agents.scout
+	$(_PHASE2_NOT_WIRED)
 
 trending:
-	python3 scripts/refresh_trending.py
+	$(_PHASE2_NOT_WIRED)
 
 N ?= 5
 process:
-	python3 scripts/process_pipeline.py --count $(N)
+	$(_PHASE2_NOT_WIRED)
 
 visuals:
 ifndef CLIP_ID
 	$(error "CLIP_ID is required; usage: make visuals CLIP_ID=2026-05-14-1200-abc")
 endif
-	python3 -m agents.visuals --clip-id $(CLIP_ID)
-
-publish:
-	python3 -m agents.publisher
+	$(_PHASE2_NOT_WIRED)
 
 digest:
-	python3 scripts/daily_digest.py
+	$(_PHASE2_NOT_WIRED)
 
 optimize:
-	python3 -m agents.optimizer
+	$(_PHASE2_NOT_WIRED)
 
 experiment:
 ifndef NAME
 	$(error "NAME is required; usage: make experiment NAME=hook_template_AB")
 endif
-	python3 scripts/open_experiment.py --name $(NAME)
+	$(_PHASE2_NOT_WIRED)
 
 rollback:
 ifndef CHANGE_ID
 	$(error "CHANGE_ID is required; usage: make rollback CHANGE_ID=<id>")
 endif
-	python3 scripts/rollback_change.py --change-id $(CHANGE_ID)
+	$(_PHASE2_NOT_WIRED)
 
 tiktok-confirm:
 ifndef CLIP_ID
@@ -73,4 +94,4 @@ endif
 ifndef POST_ID
 	$(error "POST_ID is required; usage: make tiktok-confirm CLIP_ID=<id> POST_ID=<id>")
 endif
-	python3 scripts/tiktok_confirm.py --clip-id $(CLIP_ID) --post-id $(POST_ID)
+	$(_PHASE2_NOT_WIRED)

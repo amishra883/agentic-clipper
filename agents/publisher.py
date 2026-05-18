@@ -28,11 +28,15 @@ Per CLAUDE.md "Architecture / Agent topology" — Publisher step 8.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agents.config import load
 from agents.db import connect
 from agents.events import log
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------- Platform-upload stubs ----------
@@ -93,23 +97,60 @@ def build_description(
 # ---------- Queue helpers ----------
 
 def _pick_next_clip() -> dict | None:
-    """Return the next clip due to post. Locks via status='posting' so concurrent
-    Publisher invocations don't double-fire."""
+    """Atomically claim the next clip due to post.
+
+    Three guarantees vs the prior implementation:
+
+    1. **Atomic claim.** Wraps the SELECT + UPDATE in BEGIN IMMEDIATE so a
+       concurrent Publisher process blocks (via busy_timeout) instead of
+       double-claiming the same row.
+
+    2. **Compliance JOIN.** Only returns clips whose LATEST `compliance_results`
+       row for that `clip_id` has `passed = 1`. A clip with no compliance row,
+       or whose most recent row failed, is never picked. The Compliance gate
+       is the sole legal defense per docs/fair_use_position.md; the queue
+       must not bypass it.
+
+    3. **Timezone-safe scheduled_for compare.** Posting schedule times live
+       in America/New_York with explicit ISO 8601 offsets (e.g.
+       "2026-05-17T07:00:00-04:00"); SQLite's `strftime('%s', ...)` converts
+       both sides to UTC epoch seconds so DST boundaries don't fire posts
+       early or late.
+    """
     with connect() as conn:
+        # BEGIN IMMEDIATE grabs the write lock now; concurrent publishers will
+        # wait on busy_timeout (set in db.connect()) rather than racing.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
-            SELECT * FROM clips_ready
-             WHERE status = 'queued'
-               AND scheduled_for <= datetime('now')
-             ORDER BY scheduled_for ASC
+            SELECT cr.* FROM clips_ready cr
+             WHERE cr.status = 'queued'
+               AND strftime('%s', cr.scheduled_for) <= strftime('%s', 'now')
+               AND EXISTS (
+                 SELECT 1 FROM compliance_results c
+                  WHERE c.clip_id = cr.clip_id
+                    AND c.passed = 1
+                    AND c.checked_at = (
+                      SELECT MAX(checked_at) FROM compliance_results
+                       WHERE clip_id = c.clip_id
+                    )
+               )
+             ORDER BY cr.scheduled_for ASC
              LIMIT 1
             """
         ).fetchone()
         if row is None:
             return None
-        conn.execute(
-            "UPDATE clips_ready SET status = 'posting' WHERE id = ?", (row["id"],)
+        # Conditional UPDATE: only claim if still queued. Belt-and-suspenders
+        # since BEGIN IMMEDIATE already prevents the race, but cheap defense
+        # against a stray UPDATE in the future.
+        cur = conn.execute(
+            "UPDATE clips_ready SET status = 'posting' "
+            "WHERE id = ? AND status = 'queued'",
+            (row["id"],),
         )
+        if cur.rowcount != 1:
+            return None
     return dict(row)
 
 
@@ -141,6 +182,44 @@ def _mark_failed(row_id: int, reason: str) -> None:
         )
 
 
+def _mark_manual_pending(row_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE clips_ready SET status = 'manual_pending' WHERE id = ?",
+            (row_id,),
+        )
+
+
+def _write_manual_drop(
+    *,
+    drop_root: str,
+    clip_id: str,
+    video_path: str,
+    description: str,
+    hashtags: list[str],
+) -> Path:
+    """Stage a clip for manual upload.
+
+    Writes the final video (when it exists), description, and hashtag list
+    into `drop_root/<clip_id>/`. The operator picks them up via the platform's
+    native app, then runs `make tiktok-confirm` to flip the row to 'posted'.
+
+    Returns the per-clip drop directory.
+    """
+    root = (REPO_ROOT / drop_root) if not Path(drop_root).is_absolute() else Path(drop_root)
+    clip_dir = root / clip_id
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    (clip_dir / "caption.txt").write_text(description)
+    (clip_dir / "hashtags.txt").write_text("\n".join(hashtags) + ("\n" if hashtags else ""))
+    src = Path(video_path) if video_path else None
+    if src and src.is_file():
+        # Preserve the source extension; Phase 1 compositor writes .mp4 paths
+        # but Phase 2 may emit alternatives (.mov, .webm).
+        dest = clip_dir / f"video{src.suffix or '.mp4'}"
+        shutil.copy2(src, dest)
+    return clip_dir
+
+
 def _artifact_for(clip_id: str) -> dict:
     with connect() as conn:
         row = conn.execute(
@@ -163,13 +242,14 @@ async def run_publisher() -> None:
     """Flush the ready queue until empty or until the next clip's scheduled_for
     is in the future. Each iteration posts at most one clip.
     """
-    load("posting_schedule")  # surface config errors early; consumed by Phase 2 wiring
+    schedule = load("posting_schedule")
+    platforms_cfg = schedule.get("platforms") or {}
 
     while True:
         clip = _pick_next_clip()
         if clip is None:
             log(agent="publisher", event_type="queue_empty",
-                rationale="no clips due to post")
+                rationale="no clips due to post (or none have a passing latest compliance result)")
             return
 
         platform = clip["target_platform"]
@@ -187,6 +267,53 @@ async def run_publisher() -> None:
             visuals_used=visuals_used,
             affiliate_present=affiliate_present,
         )
+
+        # Resolve the platform's posting mode from posting_schedule.yaml.
+        # The mode controls dispatch: 'manual' writes to a drop directory
+        # and waits for an operator-driven `make tiktok-confirm`; 'api'
+        # calls the platform's upload stub. Anything else fails closed.
+        platform_cfg = platforms_cfg.get(platform) or {}
+        mode = (platform_cfg.get("mode") or "").strip().lower()
+
+        if mode == "manual":
+            drop_root = platform_cfg.get("manual_drop_directory")
+            if not drop_root:
+                _mark_failed(clip["id"], f"manual_mode_missing_drop_dir:{platform}")
+                log(agent="publisher", event_type="post_failed", level="error",
+                    clip_id=clip_id, payload={"platform": platform},
+                    rationale="posting_schedule.yaml mode=manual but no manual_drop_directory configured")
+                continue
+            try:
+                clip_dir = _write_manual_drop(
+                    drop_root=drop_root,
+                    clip_id=clip_id,
+                    video_path=artifact.get("final_video_path") or "",
+                    description=description,
+                    hashtags=hashtags,
+                )
+            except Exception as exc:  # pragma: no cover — defensive only
+                _mark_failed(clip["id"], f"manual_drop_error:{exc!r}")
+                log(agent="publisher", event_type="post_failed", level="error",
+                    clip_id=clip_id, payload={"platform": platform, "error": repr(exc)},
+                    rationale="manual-drop write failed")
+                continue
+            _mark_manual_pending(clip["id"])
+            log(agent="publisher", event_type="manual_pending",
+                clip_id=clip_id,
+                payload={"platform": platform, "drop_path": str(clip_dir),
+                         "account_id": clip["account_id"]},
+                rationale=(
+                    f"staged for manual upload at {clip_dir}; operator runs "
+                    f"`make tiktok-confirm CLIP_ID={clip_id} POST_ID=...` after posting"
+                ))
+            continue
+
+        if mode != "api":
+            _mark_failed(clip["id"], f"unsupported_mode:{mode or 'unset'}:{platform}")
+            log(agent="publisher", event_type="post_failed", level="error",
+                clip_id=clip_id, payload={"platform": platform, "mode": mode},
+                rationale=f"posting_schedule.yaml mode='{mode}' for {platform} not recognized")
+            continue
 
         dispatch = _DISPATCH.get(platform)
         if dispatch is None:
@@ -224,3 +351,8 @@ async def run_publisher() -> None:
                      "account_id": clip["account_id"],
                      "posted_at": datetime.now(timezone.utc).isoformat()},
             rationale=f"posted to {platform} as {platform_post_id}")
+
+
+if __name__ == "__main__":  # pragma: no cover — CLI entrypoint for `make publish`
+    import asyncio
+    asyncio.run(run_publisher())
