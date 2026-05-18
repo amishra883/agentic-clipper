@@ -119,8 +119,10 @@ def submit_generation(api_key: str, model: str) -> str:
         "prompt": PROMPT,
         "seed": LOCKED_SEED,
         # Atlas Cloud's docs accept either size or aspect_ratio; we send both
-        # so whichever shape they expect is satisfied.
-        "size": "1024x1024",
+        # so whichever shape they expect is satisfied. Seedream v5.0-lite
+        # enforces a minimum of 3,686,400 pixels — 2048x2048 clears that with
+        # headroom while keeping the locked 1:1 aspect.
+        "size": "2048x2048",
         "aspect_ratio": "1:1",
     }
     status, raw = _request("POST", GENERATE_ENDPOINT, api_key=api_key, body=body)

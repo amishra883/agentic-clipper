@@ -41,7 +41,7 @@ Required generation parameters (locked):
 
 - `seed: 8376739915435003287`
 - `aspect_ratio: 1:1`
-- `resolution: 1024x1024` (provider's nearest)
+- `resolution: 2048x2048` (Seedream v5.0-lite minimum is 3,686,400 px ≈ 1920×1920; 2048×2048 clears that with headroom)
 - `reference_image_url: null` (this IS the reference)
 
 ## Reaction shots
