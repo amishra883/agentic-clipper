@@ -266,6 +266,64 @@ def check_live_apis() -> list[CheckResult]:
     return out
 
 
+def check_schema_version() -> list[CheckResult]:
+    """Compare `schema_version` table to the highest-numbered migration file.
+
+    If they diverge, the operator pulled new code without running `make migrate`.
+    That state is dangerous — the running pipeline may write rows that violate
+    constraints added in the unapplied migration, or read columns that don't
+    exist. Fail loudly with the exact command to fix.
+    """
+    db_path = Path(os.environ.get("AGENTIC_CLIPPER_DB", REPO_ROOT / "data" / "main.db"))
+    migrations_dir = REPO_ROOT / "migrations"
+
+    # Find the highest migration version on disk (parse `-- VERSION: N` header).
+    expected = 1  # baseline version from data/schema.sql
+    if migrations_dir.exists():
+        import re
+        version_re = re.compile(r"^--\s*VERSION:\s*(\d+)\s*$", re.MULTILINE)
+        for path in migrations_dir.glob("*.sql"):
+            m = version_re.search(path.read_text())
+            if m:
+                expected = max(expected, int(m.group(1)))
+
+    if not db_path.exists():
+        return [CheckResult(
+            "schema version",
+            False,
+            f"data/main.db missing — run `make init-db && make migrate` (expected v{expected})",
+        )]
+
+    import sqlite3
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        actual = int(row[0]) if row and row[0] is not None else 0
+    except sqlite3.OperationalError as exc:
+        return [CheckResult(
+            "schema version",
+            False,
+            f"schema_version table unreadable ({exc}) — run `make init-db`",
+        )]
+    except Exception as exc:  # pragma: no cover — defensive
+        return [CheckResult("schema version", False, f"DB query failed: {exc}")]
+
+    if actual < expected:
+        return [CheckResult(
+            "schema version",
+            False,
+            f"DB is at v{actual} but migrations/ has files through v{expected} — run `make migrate`",
+        )]
+    if actual > expected:
+        return [CheckResult(
+            "schema version",
+            False,
+            f"DB is at v{actual} but migrations/ only goes to v{expected} — likely on an older code commit; "
+            "check `git status` and `git log` against the running DB",
+        )]
+    return [CheckResult("schema version", True, f"DB v{actual} matches latest migration v{expected}")]
+
+
 def check_monthly_budget_burn() -> list[CheckResult]:
     """Compare month-to-date external spend (from the costs table) against
     monthly_cap_usd and hard_kill_switch_usd in config/budget.yaml.
@@ -401,6 +459,7 @@ CHECKS = [
     check_configs_parse,
     check_schema,
     check_db,
+    check_schema_version,
     check_env_template,
     check_avatar_seed_locked,
     check_avatar_reference_image,

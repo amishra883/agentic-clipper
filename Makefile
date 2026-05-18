@@ -1,4 +1,4 @@
-.PHONY: help phase0 init-db test doctor publish visuals \
+.PHONY: help phase0 setup setup-apply init-db migrate test doctor publish visuals \
         scout trending process digest optimize experiment rollback tiktok-confirm
 
 # === Active targets (work today) ============================================
@@ -7,7 +7,10 @@ help:
 	@echo "agentic-clipper — make targets"
 	@echo ""
 	@echo "Active:"
+	@echo "  setup            audit operator environment; print fixes for missing pieces"
+	@echo "  setup-apply      run safe automations (pip deps + init-db + migrate)"
 	@echo "  init-db          create data/main.db from data/schema.sql"
+	@echo "  migrate          apply pending schema migrations from migrations/"
 	@echo "  test             run pytest"
 	@echo "  doctor           health-check APIs, budget, strikes, warming, providers"
 	@echo "  publish          flush ready queue, respecting schedule (CLI wired)"
@@ -27,8 +30,17 @@ help:
 phase0:
 	@echo "Phase 0 is complete. See docs/phase0_digest.md for the human approval digest."
 
+setup:
+	python3 scripts/setup.py
+
+setup-apply:
+	python3 scripts/setup.py --apply
+
 init-db:
 	python3 -c "from agents.db import init_schema; init_schema()"
+
+migrate:
+	python3 scripts/migrate.py
 
 test:
 	python3 -m pytest tests/ -v

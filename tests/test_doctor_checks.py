@@ -281,3 +281,55 @@ def test_check_live_apis_marks_unreachable_as_fail(monkeypatch):
     failed = [r for r in results if not r.ok]
     assert len(failed) == 4  # YouTube, Instagram, Atlas, fal.ai
     assert all("network error" in r.detail for r in failed)
+
+
+# ---------- check_schema_version ----------
+
+def test_schema_version_passes_when_db_matches_latest_migration(doctor_db):
+    """Fresh DB has schema_version=1 baseline. With migrations/001_smoke_test.sql
+    on disk declaring VERSION 2, doctor should FAIL (db v1 < migrations v2) until
+    `make migrate` runs."""
+    from scripts import doctor
+    # Fresh DB is at v1; the live migrations/ dir has a smoke-test at v2.
+    # So this should report FAIL with the "run make migrate" message.
+    results = doctor.check_schema_version()
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert "run `make migrate`" in results[0].detail
+
+
+def test_schema_version_passes_after_migrate(doctor_db):
+    """After applying the smoke-test migration, doctor should be green."""
+    from scripts import doctor
+    from scripts.migrate import migrate
+    # Apply the live migrations
+    migrate(db_path=doctor_db)
+    results = doctor.check_schema_version()
+    assert len(results) == 1
+    assert results[0].ok is True
+    assert "matches latest migration" in results[0].detail
+
+
+def test_schema_version_fails_when_db_missing(monkeypatch, tmp_path):
+    """If data/main.db doesn't exist, the check should fail with an
+    actionable message pointing at init-db + migrate."""
+    monkeypatch.setenv("AGENTIC_CLIPPER_DB", str(tmp_path / "nope.db"))
+    from scripts import doctor
+    results = doctor.check_schema_version()
+    assert results[0].ok is False
+    assert "make init-db" in results[0].detail
+
+
+def test_schema_version_fails_when_db_ahead_of_code(doctor_db, monkeypatch, tmp_path):
+    """If the DB has been migrated past the highest file in migrations/
+    (operator on an older code commit), doctor should warn — this is the
+    scenario where someone rolls back a deploy but forgets the DB."""
+    from scripts import doctor
+    import sqlite3
+    # Hand-write a fake "v99" version into the DB
+    with sqlite3.connect(doctor_db) as conn:
+        conn.execute("INSERT INTO schema_version (version) VALUES (99)")
+        conn.commit()
+    results = doctor.check_schema_version()
+    assert results[0].ok is False
+    assert "older code commit" in results[0].detail
