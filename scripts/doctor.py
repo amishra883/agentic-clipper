@@ -96,7 +96,9 @@ def check_avatar_seed_locked() -> list[CheckResult]:
 
 
 def check_avatar_reference_image() -> list[CheckResult]:
-    ref = REPO_ROOT / "config" / "avatars" / "manic_reactor.png"
+    # Atlas Cloud's Seedream endpoint returns JPEG; .jpg is the canonical
+    # filename. A stray .png (from an earlier scaffold) would not pass.
+    ref = REPO_ROOT / "config" / "avatars" / "manic_reactor.jpg"
     if ref.exists():
         return [CheckResult("avatar reference image", True, str(ref))]
     return [CheckResult(

@@ -13,19 +13,19 @@ This directory holds locked reference images and seed values that keep our AI co
 
 | Persona ID | Persona name     | Reference image    | Locked seed          | Status |
 |------------|------------------|--------------------|----------------------|--------|
-| P-01       | manic_reactor    | `manic_reactor.png`| `8376739915435003287`| locked |
+| P-01       | manic_reactor    | `manic_reactor.jpg`| `8376739915435003287`| locked |
 
 The seed is locked so the avatar identity is reproducible. Do not change this value — changing the seed produces a different character.
 
 ## Reference image generation history
 
-Generated 2026-05-17 on Atlas Cloud's `bytedance/seedream-v5.0-lite` image API (Seedance's image sibling — Seedance itself is video-only). Three iterations on prompt; operator accepted the third. The committed `manic_reactor.png` IS the canonical reference. Do not change the seed or the prompt below without a `/proposals/` review per the "Changing the avatar later" section.
+Generated 2026-05-17 on Atlas Cloud's `bytedance/seedream-v5.0-lite` image API (Seedance's image sibling — Seedance itself is video-only). Three iterations on prompt; operator accepted the third. The committed `manic_reactor.jpg` IS the canonical reference. Do not change the seed or the prompt below without a `/proposals/` review per the "Changing the avatar later" section.
 
 **Style decision (operator, 2026-05-17):** the v3 prompt below explicitly says "NOT anime", but Seedream's training bias produced an anime/manhwa-leaning result anyway. Operator accepted the anime-leaning aesthetic as on-trend for short-form virality. The "NOT anime" clause is preserved in the prompt verbatim because it IS what was passed to the model — re-running this exact `(seed, prompt)` pair against Seedream v5.0-lite is the only way to deterministically recover this image, and changing the prompt to match the output would break that guarantee.
 
 ## Reference image prompt (manic_reactor)
 
-The exact prompt used to produce the committed `manic_reactor.png`. To reproduce, pass this verbatim with the locked seed and parameters below to `bytedance/seedream-v5.0-lite` via Atlas Cloud's `POST /api/v1/model/generateImage`. The canonical runner is `scripts/generate_avatar.py`.
+The exact prompt used to produce the committed `manic_reactor.jpg`. To reproduce, pass this verbatim with the locked seed and parameters below to `bytedance/seedream-v5.0-lite` via Atlas Cloud's `POST /api/v1/model/generateImage`. The canonical runner is `scripts/generate_avatar.py`.
 
 ```
 A stylized animated-feature illustration of an original young-adult character
@@ -57,7 +57,7 @@ Required generation parameters (locked):
 
 ## Reaction shots
 
-Every reaction shot in production passes `reference_image_url: manic_reactor.png` and `seed: 8376739915435003287`. The reaction prompts live in `/config/avatar_reactions.yaml`.
+Every reaction shot in production passes `reference_image_url: manic_reactor.jpg` and `seed: 8376739915435003287`. The reaction prompts live in `/config/avatar_reactions.yaml`.
 
 ## Compliance audit log
 

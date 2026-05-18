@@ -1,13 +1,18 @@
 """Generate the manic_reactor avatar reference image via Atlas Cloud Seedream.
 
 One-off. Run once after Atlas Cloud account is funded. The output of this
-script (config/avatars/manic_reactor.png) becomes the locked reference image
+script (config/avatars/manic_reactor.jpg) becomes the locked reference image
 for every subsequent avatar shot in production — change the seed only by
 deliberately introducing a new persona, never as a fix.
 
 Why a separate image API: Seedance is a *video* model; we need a static
 *image* for the Omni Reference handoff. Atlas Cloud serves ByteDance's
 image sibling Seedream at $0.032/image (Lite tier) via the same API key.
+
+Why .jpg and not .png: Atlas Cloud's Seedream endpoint returns JPEG bytes
+regardless of the requested format. Earlier versions of this script wrote
+those JPEG bytes to a .png filename, which silently lied about the content
+type. The script now asserts the magic bytes and writes the matching suffix.
 
 Usage:
     python scripts/generate_avatar.py             # generate + download
@@ -19,7 +24,7 @@ Reads:
     - Locked seed + prompt from constants below (mirrors config/avatars/README.md)
 
 Writes:
-    - config/avatars/manic_reactor.png
+    - config/avatars/manic_reactor.jpg
     - Audit rows in data/main.db (seedance_generations + costs) — best-effort
 """
 
@@ -36,7 +41,13 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-AVATAR_PATH = REPO_ROOT / "config" / "avatars" / "manic_reactor.png"
+AVATAR_PATH = REPO_ROOT / "config" / "avatars" / "manic_reactor.jpg"
+
+# Magic-byte prefixes for the two image formats Atlas Cloud might return.
+# Seedream v5.0-lite returns JPEG today; PNG is checked defensively so that
+# a future provider change is caught rather than silently mislabeling the file.
+JPEG_MAGIC = b"\xff\xd8\xff"
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 ATLAS_BASE = "https://api.atlascloud.ai/api/v1"
 GENERATE_ENDPOINT = f"{ATLAS_BASE}/model/generateImage"
@@ -166,6 +177,25 @@ def poll_until_done(api_key: str, pred_id: str, timeout_s: int = 180) -> dict[st
 
 def download_image(url: str, dest: Path) -> int:
     raw = _get_bytes(url)
+    if raw.startswith(JPEG_MAGIC):
+        detected = "jpeg"
+    elif raw.startswith(PNG_MAGIC):
+        detected = "png"
+    else:
+        sys.exit(
+            "downloaded bytes are neither JPEG nor PNG.\n"
+            f"  first 16 bytes (hex): {raw[:16].hex()}\n"
+            "  Atlas may have returned an error payload or changed format."
+        )
+    expected_ext = dest.suffix.lstrip(".").lower()
+    if expected_ext == "jpg":
+        expected_ext = "jpeg"
+    if detected != expected_ext:
+        sys.exit(
+            f"content-type mismatch: downloaded {detected.upper()} but "
+            f"AVATAR_PATH suffix is .{dest.suffix.lstrip('.')}. Update "
+            "AVATAR_PATH to match what the provider actually returns."
+        )
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(raw)
     return len(raw)

@@ -124,12 +124,12 @@ The script:
 1. Reads `ATLAS_CLOUD_API_KEY` from `.env` (or env).
 2. POSTs to `https://api.atlascloud.ai/api/v1/model/generateImage` with model `seedream-v5.0-lite`, the locked prompt, and seed `8376739915435003287`.
 3. Polls the prediction endpoint until status=`completed`.
-4. Downloads the result to `config/avatars/manic_reactor.png`.
+4. Downloads the result to `config/avatars/manic_reactor.jpg`.
 5. Writes provenance + cost rows to `data/main.db` (`seedance_generations`, `costs`).
 
 **Verify the result before committing:**
 
-- Open `config/avatars/manic_reactor.png` in any image viewer.
+- Open `config/avatars/manic_reactor.jpg` in any image viewer.
 - Is it clearly cartoon-coded (NOT photoreal)?
 - Headphones-around-neck signature accessory visible?
 - Front-facing, mid-grin expression?
@@ -138,12 +138,12 @@ The script:
 If it looks right:
 
 ```bash
-git add config/avatars/manic_reactor.png
+git add config/avatars/manic_reactor.jpg
 git commit -m "Lock manic_reactor avatar reference image"
 git push
 ```
 
-If it does NOT look right, **do not** change the seed (`8376739915435003287` is final). Tweak the `PROMPT` constant in `scripts/generate_avatar.py` and re-run — the script overwrites `manic_reactor.png` each call. Once you're happy with the image, commit, and the seed stays locked forever after.
+If it does NOT look right, **do not** change the seed (`8376739915435003287` is final). Tweak the `PROMPT` constant in `scripts/generate_avatar.py` and re-run — the script overwrites `manic_reactor.jpg` each call. Once you're happy with the image, commit, and the seed stays locked forever after.
 
 **Why a script instead of `curl`:** Atlas Cloud's Seedream API is async — submit returns a prediction ID, you poll for completion, then download. Easier to wrap once than to type out three curl-and-jq incantations every time you want to iterate on the prompt. The script is also the basis for Phase 2's Visuals image-gen wiring.
 

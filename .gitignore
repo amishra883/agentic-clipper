@@ -1,7 +1,7 @@
 # agentic-clipper
 
 # Secrets
-.env Youtube API: AIzaSyBvLwHKJ-7yI4tchf2Xtia5-s9blbxFG14 Atlas API: 173e3e20f58d4697b09a2eaa6f905b03
+.env
 .env.*
 !.env.example
 

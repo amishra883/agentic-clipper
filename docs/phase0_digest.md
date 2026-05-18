@@ -133,7 +133,7 @@ Virality-threshold rule for Pro promotion (encoded for Phase 1): `Curator score 
 - **Locked seed:** `8376739915435003287` (recorded in `config/avatars/README.md`).
 - **Reference image: NOT YET GENERATED** — deferred until Atlas Cloud account exists. Generating it on a different model would cause visual drift when re-generated on Seedance later. Generation prompt is locked and ready in `config/avatars/README.md`.
 
-**Action item:** generate `config/avatars/manic_reactor.png` during Phase 1's first Seedance call, commit, and we're brand-locked.
+**Action item:** generate `config/avatars/manic_reactor.jpg` during Phase 1's first Seedance call, commit, and we're brand-locked.
 
 ## Red flags that want operator decisions before Phase 1
 
