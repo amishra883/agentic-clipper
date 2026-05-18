@@ -1,5 +1,5 @@
 .PHONY: help phase0 setup setup-apply init-db migrate test doctor publish visuals \
-        scout trending process digest optimize experiment rollback tiktok-confirm
+        morning scout trending process digest optimize experiment rollback tiktok-confirm
 
 # === Active targets (work today) ============================================
 
@@ -7,6 +7,7 @@ help:
 	@echo "agentic-clipper — make targets"
 	@echo ""
 	@echo "Active:"
+	@echo "  morning          (recommended daily entry) digest + actions + queue"
 	@echo "  setup            audit operator environment; print fixes for missing pieces"
 	@echo "  setup-apply      run safe automations (pip deps + init-db + migrate)"
 	@echo "  init-db          create data/main.db from data/schema.sql"
@@ -21,7 +22,6 @@ help:
 	@echo "  trending         refresh data/trending.md"
 	@echo "  process N=5      run full pipeline on next N candidates"
 	@echo "  visuals CLIP_ID=<id>  re-run only Visuals stage"
-	@echo "  digest           produce today's human digest"
 	@echo "  optimize         run Optimizer manually"
 	@echo "  experiment NAME=<name>     open a bandit experiment"
 	@echo "  rollback CHANGE_ID=<id>    roll back an auto-applied change"
@@ -29,6 +29,12 @@ help:
 
 phase0:
 	@echo "Phase 0 is complete. See docs/phase0_digest.md for the human approval digest."
+
+morning:
+	python3 -m agents.digest morning
+
+digest:
+	python3 -m agents.digest
 
 setup:
 	python3 scripts/setup.py
@@ -79,9 +85,6 @@ visuals:
 ifndef CLIP_ID
 	$(error "CLIP_ID is required; usage: make visuals CLIP_ID=2026-05-14-1200-abc")
 endif
-	$(_PHASE2_NOT_WIRED)
-
-digest:
 	$(_PHASE2_NOT_WIRED)
 
 optimize:
