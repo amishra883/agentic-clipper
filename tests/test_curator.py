@@ -30,10 +30,12 @@ from agents.curator import (
     _is_borderline,
     _llm_tiebreaker_score,
     _promote_with_cas,
+    _resolve_llm_caps,
     _select_discovered,
     run_curator,
 )
 from agents.db import init_schema
+from agents.retry import RetryGiveUp, TransientError
 from scripts.migrate import migrate
 
 
@@ -124,11 +126,12 @@ def test_select_returns_only_discovered(curator_db):
 
 def test_promote_with_cas_flips_status(curator_db):
     _seed_candidates(curator_db, count=3)
-    actual = _promote_with_cas([
+    promoted_ids, lost_ids = _promote_with_cas([
         ("twitch-test-0000", 0.85),
         ("twitch-test-0001", 0.72),
     ])
-    assert actual == 2
+    assert sorted(promoted_ids) == ["twitch-test-0000", "twitch-test-0001"]
+    assert lost_ids == []
     with sqlite3.connect(curator_db) as conn:
         conn.row_factory = sqlite3.Row
         rows = {r["id"]: dict(r) for r in conn.execute(
@@ -155,11 +158,12 @@ def test_promote_with_cas_misses_already_curated(curator_db):
         )
         conn.commit()
     # Our run targets both
-    actual = _promote_with_cas([
+    promoted_ids, lost_ids = _promote_with_cas([
         ("twitch-test-0000", 0.50),  # already curated; should miss
         ("twitch-test-0001", 0.60),  # discovered; should hit
     ])
-    assert actual == 1
+    assert promoted_ids == ["twitch-test-0001"]
+    assert lost_ids == ["twitch-test-0000"]
     # The already-curated row's score was NOT overwritten
     with sqlite3.connect(curator_db) as conn:
         row = conn.execute(
@@ -169,7 +173,7 @@ def test_promote_with_cas_misses_already_curated(curator_db):
 
 
 def test_promote_with_cas_empty_list_returns_zero(curator_db):
-    assert _promote_with_cas([]) == 0
+    assert _promote_with_cas([]) == ([], [])
 
 
 # ---------- run_curator end-to-end ----------
@@ -383,3 +387,164 @@ def test_concurrent_promote_with_cas_lost_race_logged(curator_db, monkeypatch):
     summary = asyncio.run(run_curator(batch_size=2))
     # We targeted 2, but lost 1 to the simulated concurrent run
     assert summary.promoted == 1
+
+
+# ---------- Day 4 hardening (Codex 2026-05-18) ----------
+
+def test_resolve_llm_caps_loads_defaults_from_budget_yaml(curator_db):
+    """Explicit None caps → load from config/budget.yaml line items and
+    per_call_caps. The config-resident values guard against caller-side
+    omissions burning the Anthropic budget."""
+    monthly, daily = _resolve_llm_caps(
+        line_item_cap_usd=None, daily_cap_usd=None, allow_uncapped=False,
+    )
+    # config/budget.yaml: anthropic_api_buffer.monthly_budget_usd = 40
+    # config/budget.yaml: per_call_caps.anthropic_daily_usd_max = 3.0
+    assert monthly == 40
+    assert daily == 3.0
+
+
+def test_resolve_llm_caps_explicit_args_override_config(curator_db):
+    """Explicit caller args always take precedence over config defaults."""
+    monthly, daily = _resolve_llm_caps(
+        line_item_cap_usd=99.0, daily_cap_usd=12.5, allow_uncapped=False,
+    )
+    assert monthly == 99.0
+    assert daily == 12.5
+
+
+def test_resolve_llm_caps_allow_uncapped_permits_none(curator_db, monkeypatch):
+    """`allow_uncapped=True` is the test-only escape hatch: bypasses
+    the ValueError when no cap can be resolved (config missing)."""
+    # Force config load to return empty so neither explicit nor config
+    # provides a monthly cap.
+    monkeypatch.setattr("agents.curator.load", lambda _name: {})
+    monthly, daily = _resolve_llm_caps(
+        line_item_cap_usd=None, daily_cap_usd=None, allow_uncapped=True,
+    )
+    assert monthly is None
+    assert daily is None
+
+
+def test_resolve_llm_caps_raises_when_no_cap_resolvable(curator_db, monkeypatch):
+    """Production callers (allow_uncapped=False) MUST end up with a
+    monthly cap. If config is empty and the caller passed None, we
+    refuse rather than silently running uncapped."""
+    monkeypatch.setattr("agents.curator.load", lambda _name: {})
+    with pytest.raises(ValueError, match="no anthropic_api_buffer monthly cap"):
+        _resolve_llm_caps(
+            line_item_cap_usd=None, daily_cap_usd=None, allow_uncapped=False,
+        )
+
+
+def test_borderline_transient_llm_error_falls_back_to_heuristic(curator_db):
+    """Codex 2026-05-18: a RetryGiveUp from the LLM call (provider 5xx
+    after exhausting retries) used to abort the entire Curator run.
+    Now it settles 'failed' and the run continues with the heuristic
+    score."""
+    with sqlite3.connect(curator_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO clips_candidate
+              (id, creator, source_platform, source_url, source_view_count, status)
+            VALUES ('twitch-transient', 'Sketch', 'twitch',
+                    'https://twitch.tv/sketch/clip/transient', 10_000, 'discovered')
+            """
+        )
+        conn.commit()
+
+    async def fake_llm_raises(candidate, heuristic):
+        raise RetryGiveUp("anthropic 502 after 3 attempts")
+
+    with patch("agents.curator._llm_tiebreaker_score", side_effect=fake_llm_raises):
+        summary = asyncio.run(run_curator(batch_size=1))
+
+    # Run did NOT abort. LLM was attempted, did not succeed, heuristic kept.
+    assert summary.llm_calls_attempted == 1
+    assert summary.llm_calls_succeeded == 0
+    assert summary.promoted == 1
+
+    # Reservation settled 'failed' with zero cost.
+    with sqlite3.connect(curator_db) as conn:
+        row = conn.execute(
+            "SELECT status, amount_usd FROM costs "
+            "WHERE category='anthropic_api_buffer' AND clip_id='twitch-transient'"
+        ).fetchone()
+    assert row[0] == "failed"
+    assert row[1] == 0.0
+
+
+def test_borderline_timeout_error_falls_back_to_heuristic(curator_db):
+    """asyncio.TimeoutError is in the same transient bucket as RetryGiveUp."""
+    with sqlite3.connect(curator_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO clips_candidate
+              (id, creator, source_platform, source_url, source_view_count, status)
+            VALUES ('twitch-timeout', 'Sketch', 'twitch',
+                    'https://twitch.tv/sketch/clip/timeout', 10_000, 'discovered')
+            """
+        )
+        conn.commit()
+
+    async def fake_llm_times_out(candidate, heuristic):
+        raise asyncio.TimeoutError()
+
+    with patch("agents.curator._llm_tiebreaker_score", side_effect=fake_llm_times_out):
+        summary = asyncio.run(run_curator(batch_size=1))
+
+    assert summary.llm_calls_attempted == 1
+    assert summary.llm_calls_succeeded == 0
+    assert summary.promoted == 1
+
+
+def test_borderline_concurrent_lease_skips_llm_call(curator_db):
+    """Codex 2026-05-18: per-clip stage_lease around the LLM dispatch.
+    If another worker holds the curator lease for this clip, we must
+    NOT reserve budget or call the LLM — second Curator falls back to
+    heuristic, zero double-pay."""
+    from agents.stage_lease import stage_lease
+
+    with sqlite3.connect(curator_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO clips_candidate
+              (id, creator, source_platform, source_url, source_view_count, status)
+            VALUES ('twitch-leased', 'Sketch', 'twitch',
+                    'https://twitch.tv/sketch/clip/leased', 10_000, 'discovered')
+            """
+        )
+        conn.commit()
+
+    # Hold the curator lease for this clip in a separate context
+    # before run_curator gets to it; the lease conflict should make
+    # the inner LLM dispatch a no-op.
+    llm_attempts = []
+
+    async def fake_llm(candidate, heuristic):
+        llm_attempts.append(candidate.id)
+        return 0.6
+
+    with stage_lease("twitch-leased", stage="curator", ttl_seconds=60):
+        with patch("agents.curator._llm_tiebreaker_score", side_effect=fake_llm):
+            summary = asyncio.run(run_curator(batch_size=1))
+
+    # The borderline clip should have been considered, but the LLM
+    # call short-circuited at the lease — zero attempts.
+    assert "twitch-leased" not in llm_attempts
+    assert summary.llm_calls_attempted == 0
+    # And critically: zero cost reservations for this clip.
+    with sqlite3.connect(curator_db) as conn:
+        rows = conn.execute(
+            "SELECT * FROM costs WHERE clip_id='twitch-leased'"
+        ).fetchall()
+    assert rows == []
+
+
+def test_run_curator_test_callers_use_allow_uncapped_or_explicit_caps(curator_db, monkeypatch):
+    """If config/budget.yaml is unreadable AND the caller didn't pass
+    caps AND allow_uncapped=False, run_curator should refuse before
+    any DB work happens."""
+    monkeypatch.setattr("agents.curator.load", lambda _name: {})
+    with pytest.raises(ValueError, match="no anthropic_api_buffer monthly cap"):
+        asyncio.run(run_curator(batch_size=1, allow_uncapped=False))

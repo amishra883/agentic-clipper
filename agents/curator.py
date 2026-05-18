@@ -22,6 +22,7 @@ Per CLAUDE.md "Architecture / Agent topology" — Curator step 2.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 
@@ -30,6 +31,8 @@ from agents.costs import BudgetExceeded, reserve, settle
 from agents.db import connect
 from agents.events import log
 from agents.models import CandidateClip
+from agents.retry import RetryGiveUp
+from agents.stage_lease import LeaseConflict, stage_lease
 
 
 # Creator-weight applied to the log-view-count heuristic. Phase 2 LLM
@@ -102,12 +105,64 @@ async def _refine_with_llm_or_fallback(
     """Reserve budget, attempt LLM tiebreaker, settle. Returns
     (final_score, llm_attempted, llm_succeeded).
 
-    Errors:
-        - BudgetExceeded → no reservation, no call, heuristic score wins
-        - NotImplementedError → reservation settled as 'failed' (zero
-          actual cost), heuristic score wins
-        - Other Exception → reservation settled as 'failed', re-raised
+    Race-prevention (Codex 2026-05-18 fix): wrap the LLM call in a
+    per-clip `stage_lease(candidate.id, "curator")`. Two concurrent
+    Curators on the same borderline clip would otherwise both reserve
+    budget, both call the LLM, both pay — even though only one wins
+    the eventual _promote_with_cas race. The lease blocks the second
+    Curator at acquire time (LeaseConflict before any reservation
+    happens) → zero double-pay. The loser falls back to heuristic.
+
+    The lease ttl is 60s — short enough that a crashed/hung Curator
+    doesn't block the second worker for long; the janitor sweep
+    handles the cleanup. We don't set output_artifact_version on the
+    lease because Curator doesn't write a clip artifact (only
+    clips_candidate state changes).
+
+    Error handling:
+        - LeaseConflict (acquire) → another Curator owns this clip;
+          heuristic wins, attempted=False, no cost
+        - BudgetExceeded (reserve) → cap protection fired; heuristic
+          wins, attempted=False, no cost
+        - NotImplementedError (Phase 1 stub) → settle failed (zero
+          cost), heuristic wins, attempted=True succeeded=False
+        - asyncio.TimeoutError / RetryGiveUp → transient, fall back
+          to heuristic, run continues; previously aborted run
+        - Other Exception → settle failed, re-raise (programming
+          bugs shouldn't be swallowed)
     """
+    try:
+        with stage_lease(candidate.id, stage="curator", ttl_seconds=60):
+            return await _do_llm_tiebreaker(
+                candidate, heuristic,
+                line_item_cap_usd=line_item_cap_usd,
+                daily_cap_usd=daily_cap_usd,
+            )
+    except LeaseConflict:
+        log(
+            agent="curator",
+            event_type="llm_skipped_concurrent",
+            level="info",
+            clip_id=candidate.id,
+            payload={"heuristic_score": heuristic},
+            rationale=(
+                "another Curator already holds the curator lease for this clip; "
+                "skipping LLM tiebreaker to avoid double-pay"
+            ),
+        )
+        return heuristic, False, False
+
+
+async def _do_llm_tiebreaker(
+    candidate: CandidateClip,
+    heuristic: float,
+    *,
+    line_item_cap_usd: float | None,
+    daily_cap_usd: float | None,
+) -> tuple[float, bool, bool]:
+    """Inner: actually reserve + call + settle. Wrapped by the
+    stage_lease in `_refine_with_llm_or_fallback` so concurrent
+    Curators on the same clip back off at acquire time."""
     try:
         reservation = reserve(
             category="anthropic_api_buffer",
@@ -134,7 +189,6 @@ async def _refine_with_llm_or_fallback(
         settle(reservation, actual_amount_usd=_LLM_COST_PER_TIEBREAKER_USD, status="succeeded")
         return max(0.0, min(1.0, refined)), True, True
     except NotImplementedError:
-        # Phase 1 stub: settle as failed (zero cost), fall back to heuristic
         settle(reservation, actual_amount_usd=0.0, status="failed")
         log(
             agent="curator",
@@ -145,9 +199,25 @@ async def _refine_with_llm_or_fallback(
             rationale="LLM tiebreaker stubbed; heuristic score retained",
         )
         return heuristic, True, False
+    except (asyncio.TimeoutError, RetryGiveUp) as exc:
+        # Codex 2026-05-18: transient LLM failures (provider 5xx wrapped
+        # in RetryGiveUp, asyncio timeout, etc.) previously aborted the
+        # entire Curator run, leaving every candidate stuck in
+        # 'discovered'. Now: settle failed, log, fall back to heuristic.
+        settle(reservation, actual_amount_usd=0.0, status="failed")
+        log(
+            agent="curator",
+            event_type="llm_transient_failure",
+            level="warn",
+            clip_id=candidate.id,
+            payload={
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "heuristic_score": heuristic,
+            },
+            rationale="transient LLM failure; heuristic score retained, run continues",
+        )
+        return heuristic, True, False
     except Exception:
-        # Live-mode LLM call failed; record the failed reservation so
-        # the daily cap reflects reality
         settle(reservation, actual_amount_usd=0.0, status="failed")
         raise
 
@@ -175,22 +245,21 @@ def _select_discovered(batch_scan_limit: int) -> list[dict]:
 
 def _promote_with_cas(
     promoted: list[tuple[str, float]],
-) -> int:
+) -> tuple[list[str], list[str]]:
     """Atomically flip the promoted clips from 'discovered' → 'curated'.
 
-    BEGIN IMMEDIATE serializes concurrent Curators at the SQLite lock
-    layer. The conditional UPDATE (`WHERE id=? AND status='discovered'`)
-    is the actual race guard: if another Curator beat us to a row, our
-    UPDATE matches zero rows and that promotion silently no-ops.
-
-    Returns the number of rows actually promoted. A return value less
-    than len(promoted) means one or more clips were claimed by a
-    concurrent Curator between our SELECT and our UPDATE — that's
-    expected and safe; the caller logs the count.
+    Returns `(actually_promoted_ids, lost_to_race_ids)`. Codex 2026-05-18
+    finding: the prior implementation returned only an aggregate count,
+    so the caller's per-clip `clip_curated` log fired for ALL targets,
+    even ones whose conditional UPDATE matched zero rows. Now the caller
+    can log promoted events for the winners and a separate
+    `clip_lost_to_race` event for the losers — the audit trail no
+    longer claims promotions that didn't actually land.
     """
     if not promoted:
-        return 0
-    actual = 0
+        return [], []
+    actually_promoted: list[str] = []
+    lost: list[str] = []
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -205,7 +274,10 @@ def _promote_with_cas(
                     """,
                     (score, clip_id),
                 )
-                actual += cur.rowcount
+                if cur.rowcount == 1:
+                    actually_promoted.append(clip_id)
+                else:
+                    lost.append(clip_id)
             conn.execute("COMMIT")
         except Exception:
             try:
@@ -213,7 +285,7 @@ def _promote_with_cas(
             except Exception:
                 pass
             raise
-    return actual
+    return actually_promoted, lost
 
 
 # ---------- Helpers ----------
@@ -234,26 +306,76 @@ def _row_to_candidate(row: dict) -> CandidateClip:
 
 # ---------- Public entry point ----------
 
+def _resolve_llm_caps(
+    *,
+    line_item_cap_usd: float | None,
+    daily_cap_usd: float | None,
+    allow_uncapped: bool,
+) -> tuple[float | None, float | None]:
+    """Resolve LLM cost caps. If a cap is explicitly passed, use it.
+    Otherwise load from `config/budget.yaml` (line_items.anthropic_api_buffer.
+    monthly_budget_usd + per_call_caps.anthropic_daily_usd_max).
+
+    Codex 2026-05-18 finding: previously the defaults were None, which
+    meant "no enforcement" — a caller that forgot to pass caps would
+    burn the Anthropic budget without guardrails. Now we look at the
+    config; only `allow_uncapped=True` permits None caps.
+    """
+    if line_item_cap_usd is not None and daily_cap_usd is not None:
+        return line_item_cap_usd, daily_cap_usd
+    try:
+        budget = load("budget")
+        line_items = budget.get("line_items") or {}
+        per_call = budget.get("per_call_caps") or {}
+        cfg_monthly = (line_items.get("anthropic_api_buffer") or {}).get("monthly_budget_usd")
+        cfg_daily = per_call.get("anthropic_daily_usd_max")
+        resolved_monthly = line_item_cap_usd if line_item_cap_usd is not None else cfg_monthly
+        resolved_daily = daily_cap_usd if daily_cap_usd is not None else cfg_daily
+    except Exception:
+        resolved_monthly = line_item_cap_usd
+        resolved_daily = daily_cap_usd
+
+    if not allow_uncapped:
+        if resolved_monthly is None:
+            raise ValueError(
+                "run_curator: no anthropic_api_buffer monthly cap resolved from "
+                "config/budget.yaml. Pass llm_line_item_cap_usd explicitly OR set "
+                "allow_uncapped=True for test-only unrestricted mode."
+            )
+    return resolved_monthly, resolved_daily
+
+
 async def run_curator(
     batch_size: int = 10,
     *,
     batch_scan_limit: int = 50,
     llm_line_item_cap_usd: float | None = None,
     llm_daily_cap_usd: float | None = None,
+    allow_uncapped: bool = False,
 ) -> CuratorRunSummary:
     """Score discovered candidates; promote top `batch_size` to 'curated'.
-
-    Returns a CuratorRunSummary for audit. The shape changed in Day 4 —
-    callers that used the legacy list return need updating.
 
     Parameters:
         batch_size: how many promotions to make this run
         batch_scan_limit: max discovered rows to consider per run
-        llm_line_item_cap_usd / llm_daily_cap_usd: budget caps for the
-            anthropic_api_buffer category. None = no enforcement (caller's
-            policy). Phase 2 should read these from config/budget.yaml.
+        llm_line_item_cap_usd: monthly Anthropic cap. None → load from
+            config/budget.yaml line_items.anthropic_api_buffer.monthly_budget_usd.
+            If config has no value AND caller didn't pass one, ValueError
+            unless `allow_uncapped=True`.
+        llm_daily_cap_usd: per-day cap. None → load from config (per_call_caps.
+            anthropic_daily_usd_max). Optional in production; None is OK.
+        allow_uncapped: test-only escape hatch. Production callers must
+            either pass caps explicitly or accept the config defaults.
+
+    Returns a CuratorRunSummary. Shape changed in Day 4 — callers that
+    used the legacy list return need updating.
     """
     load("optimizer_bounds")  # surface config load errors early
+    resolved_monthly, resolved_daily = _resolve_llm_caps(
+        line_item_cap_usd=llm_line_item_cap_usd,
+        daily_cap_usd=llm_daily_cap_usd,
+        allow_uncapped=allow_uncapped,
+    )
 
     summary = CuratorRunSummary(
         considered=0, promoted=0, skipped_no_budget=0,
@@ -281,8 +403,8 @@ async def run_curator(
         if _is_borderline(heuristic):
             final_score, attempted, succeeded = await _refine_with_llm_or_fallback(
                 candidate, heuristic,
-                line_item_cap_usd=llm_line_item_cap_usd,
-                daily_cap_usd=llm_daily_cap_usd,
+                line_item_cap_usd=resolved_monthly,
+                daily_cap_usd=resolved_daily,
             )
             if attempted:
                 summary.llm_calls_attempted += 1
@@ -305,35 +427,39 @@ async def run_curator(
     # E-4 atomic claim: conditional UPDATE serialized via BEGIN IMMEDIATE.
     # A concurrent Curator that raced us to any of these rows would have
     # already flipped them to 'curated'; our UPDATE silently no-ops on
-    # those (cur.rowcount = 0). `actual_promoted` reflects what we
-    # actually got, which may be less than what we targeted.
-    actual_promoted = _promote_with_cas(target)
-    summary.promoted = actual_promoted
+    # those (cur.rowcount = 0). Codex 2026-05-18: return both
+    # actually-promoted AND lost-to-race ids so per-clip event logs fire
+    # only for the rows we actually claimed — no more audit divergence.
+    promoted_ids, lost_ids = _promote_with_cas(target)
+    summary.promoted = len(promoted_ids)
 
-    if actual_promoted < len(target):
+    if lost_ids:
+        # Concurrent contention is expected under multi-worker setups —
+        # info-level, not warn. Operators see it in the digest if needed
+        # but it doesn't fire the alerts panel.
         log(
             agent="curator",
             event_type="concurrent_claim_lost",
-            level="warn",
-            payload={"targeted": len(target), "actually_promoted": actual_promoted},
+            level="info",
+            payload={
+                "targeted": len(target),
+                "actually_promoted": len(promoted_ids),
+                "lost_to_race": lost_ids,
+            },
             rationale=(
                 "another Curator run claimed some of our targeted rows between "
                 "our SELECT and our UPDATE. Lost rows are theirs; we keep the rest."
             ),
         )
 
-    # Log promotions that DID succeed (caller can audit by clip_id).
-    # We can't tell from cur.rowcount which specific rows landed vs lost,
-    # so the per-clip log here is "intended to promote" not "did promote".
-    # That's OK — the events table + clips_candidate.curated_at gives
-    # the operator the after-the-fact record.
-    for cid, score in target:
+    score_lookup = dict(target)
+    for cid in promoted_ids:
         log(
             agent="curator",
             event_type="clip_curated",
             clip_id=cid,
-            payload={"score": score},
-            rationale=f"promoted with score {score:.3f}",
+            payload={"score": score_lookup[cid]},
+            rationale=f"promoted with score {score_lookup[cid]:.3f}",
         )
 
     for cid, score in skipped:

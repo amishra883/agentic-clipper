@@ -41,7 +41,7 @@ import functools
 import inspect
 import random
 import time
-from typing import Awaitable, Callable, TypeVar
+from typing import Callable, TypeVar
 
 
 class TransientError(Exception):
@@ -97,6 +97,14 @@ def retry_external(
         raise ValueError(f"max_attempts must be >= 1; got {max_attempts}")
     if base_delay_s <= 0:
         raise ValueError(f"base_delay_s must be > 0; got {base_delay_s}")
+    # Codex 2026-05-18 finding: prior code only validated max_attempts and
+    # base_delay_s. max_delay_s=0 produces a tight retry loop with no sleep
+    # (the min(...) clamps every backoff to 0); jitter_factor<0 yields
+    # negative delays → asyncio.sleep / time.sleep raise.
+    if max_delay_s <= 0:
+        raise ValueError(f"max_delay_s must be > 0; got {max_delay_s}")
+    if jitter_factor < 0:
+        raise ValueError(f"jitter_factor must be >= 0; got {jitter_factor}")
 
     def _compute_delay(attempt: int) -> float:
         # attempt is 1-indexed for human readability

@@ -15,8 +15,6 @@ import asyncio
 import sqlite3
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
-
 import pytest
 
 from agents.db import init_schema
@@ -48,7 +46,7 @@ def migrated_db(monkeypatch):
 def _clip(
     *,
     platform: str = "twitch",
-    url: str = "https://www.twitch.tv/ishowspeed/clip/AbcDef123",
+    url: str = "https://www.twitch.tv/ishowspeed/clip/ImpressivePoorIcecream",
     creator: str = "IShowSpeed",
     view_count: int = 50000,
 ) -> CandidateClip:
@@ -102,13 +100,16 @@ def test_make_clip_id_format_short_enough():
 # ---------- E-14: source_url validation ----------
 
 def test_validate_url_passes_canonical_twitch():
-    _validate_source_url("twitch", "https://www.twitch.tv/ishowspeed/clip/AbcDef")
-    _validate_source_url("twitch", "https://clips.twitch.tv/AbcDef123")
+    # Twitch clip slugs are title-cased word strings, typically 30+ chars.
+    # Our canonicalizer enforces 8-80 chars to match real Twitch shape.
+    _validate_source_url("twitch", "https://www.twitch.tv/ishowspeed/clip/ImpressivePoorIcecream")
+    _validate_source_url("twitch", "https://clips.twitch.tv/ImpressivePoorIcecream-jKj7r3eY")
 
 
 def test_validate_url_passes_canonical_youtube():
-    _validate_source_url("youtube", "https://www.youtube.com/watch?v=AbCdEf")
-    _validate_source_url("youtube", "https://youtu.be/AbCdEf")
+    # Real YouTube video_ids are exactly 11 chars: [A-Za-z0-9_-]{11}
+    _validate_source_url("youtube", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    _validate_source_url("youtube", "https://youtu.be/dQw4w9WgXcQ")
 
 
 def test_validate_url_passes_canonical_tiktok():
@@ -217,7 +218,12 @@ def test_insert_raises_on_invalid_url(migrated_db):
 def test_two_scout_runs_produce_no_duplicates(migrated_db, monkeypatch):
     """The full Scout flow: monkey-patch the dispatchers to return a
     fixed candidate set, run scout twice, assert no duplicates."""
-    fixed_clips = [_clip(url=f"https://twitch.tv/sketch/clip/{i:03d}") for i in range(5)]
+    # Slugs need to satisfy the 8-80 char Twitch-clip-slug shape, so we
+    # build distinct slugs by suffix.
+    fixed_clips = [
+        _clip(url=f"https://twitch.tv/sketch/clip/SilentTrappedKangaroo{i:03d}")
+        for i in range(5)
+    ]
     fixed_clips[0] = _clip(creator="Sketch")  # one with a real-looking creator
 
     async def fake_dispatch(handle):
@@ -335,3 +341,116 @@ def test_retry_rejects_invalid_params():
         retry_external(max_attempts=0)  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="base_delay_s must be > 0"):
         retry_external(base_delay_s=0)  # type: ignore[call-arg]
+
+
+def test_retry_rejects_zero_max_delay():
+    """Codex 2026-05-18: max_delay_s <= 0 produced a tight retry loop
+    (min(backoff, 0) clamps every sleep to zero). Now rejected at
+    decoration time."""
+    with pytest.raises(ValueError, match="max_delay_s must be > 0"):
+        retry_external(max_delay_s=0)  # type: ignore[call-arg]
+
+
+def test_retry_rejects_negative_jitter():
+    """Negative jitter would make delays negative → asyncio.sleep raises.
+    Reject at decoration time."""
+    with pytest.raises(ValueError, match="jitter_factor must be >= 0"):
+        retry_external(jitter_factor=-0.1)  # type: ignore[call-arg]
+
+
+# ---------- Codex 2026-05-18: canonical-URL / id-collision fixes ----------
+
+def test_canonical_url_collapses_youtube_variants():
+    """The exact bug Codex flagged: youtube.com/watch?v=X and youtu.be/X
+    are the same video. They MUST produce the same canonical URL — and
+    thus the same clip_id — so UNIQUE(source_url) actually de-dupes."""
+    from agents.scout import canonicalize_source_url
+    full = canonicalize_source_url("youtube", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    short = canonicalize_source_url("youtube", "https://youtu.be/dQw4w9WgXcQ")
+    shorts_url = canonicalize_source_url("youtube", "https://www.youtube.com/shorts/dQw4w9WgXcQ")
+    embed = canonicalize_source_url("youtube", "https://www.youtube.com/embed/dQw4w9WgXcQ")
+    # All four collapse to the same canonical form.
+    assert full == short == shorts_url == embed
+    assert full == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def test_canonical_url_collapses_twitch_clip_variants():
+    """twitch.tv/<channel>/clip/<slug> ≡ clips.twitch.tv/<slug>."""
+    from agents.scout import canonicalize_source_url
+    long_form = canonicalize_source_url("twitch", "https://www.twitch.tv/ishowspeed/clip/ImpressivePoorIcecream")
+    short = canonicalize_source_url("twitch", "https://clips.twitch.tv/ImpressivePoorIcecream")
+    assert long_form == short
+    assert long_form == "https://clips.twitch.tv/ImpressivePoorIcecream"
+
+
+def test_canonical_url_rejects_url_encoded_metachars():
+    """Codex empirically verified: `%3B` (encoded `;`) sailed through
+    the prior regex because the regex matched encoded bytes not decoded
+    content. canonicalize_source_url now urllib-decodes the path and
+    rejects shell metachars in the DECODED form."""
+    from agents.scout import canonicalize_source_url
+    with pytest.raises(InvalidSourceUrlError, match="shell metacharacter"):
+        canonicalize_source_url(
+            "twitch",
+            "https://www.twitch.tv/foo%3Brm%20-rf%20/clip/ImpressivePoorIcecream",
+        )
+
+
+def test_canonical_url_rejects_url_encoded_path_traversal():
+    """`%2E%2E%2F` decodes to `../` — must be rejected after decoding."""
+    from agents.scout import canonicalize_source_url
+    with pytest.raises(InvalidSourceUrlError):
+        canonicalize_source_url(
+            "twitch",
+            "https://www.twitch.tv/foo/%2E%2E/clip/ImpressivePoorIcecream",
+        )
+
+
+def test_canonical_url_rejects_idna_confusable_host():
+    """Codex flagged twitchһ.tv (Cyrillic 'h') — IDNA encoding either
+    converts it to its punycode form (which fails the allowlist) or
+    raises UnicodeError. Either way: rejected."""
+    from agents.scout import canonicalize_source_url
+    with pytest.raises(InvalidSourceUrlError):
+        canonicalize_source_url(
+            "twitch",
+            "https://twitchһ.tv/foo/clip/ImpressivePoorIcecream",
+        )
+
+
+def test_clip_id_derived_from_canonical_form_collapses_youtube_variants():
+    """The actual de-dupe path: _insert_candidate canonicalizes the URL
+    and re-derives the clip_id from the canonical form. So two scout
+    runs that each see a different shape of the same YouTube video
+    both collide on UNIQUE(source_url) AND on the primary key —
+    BOTH protections fire."""
+    from agents.scout import canonicalize_source_url
+    canon_full = canonicalize_source_url("youtube", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    canon_short = canonicalize_source_url("youtube", "https://youtu.be/dQw4w9WgXcQ")
+    # Same canonical → same id when derived from canonical.
+    assert make_clip_id("youtube", canon_full) == make_clip_id("youtube", canon_short)
+
+
+def test_youtube_variants_dedupe_at_insert(migrated_db):
+    """End-to-end: a youtube.com/watch?v=X insert followed by a
+    youtu.be/X insert with the same video both collapse — the second
+    is a no-op (rowcount=0), DB has exactly one row."""
+    from agents.models import CandidateClip
+    full = CandidateClip(
+        id="yt-raw-1",  # raw id; _insert_candidate re-derives
+        creator="MrBeast",
+        source_platform="youtube",
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    )
+    short = CandidateClip(
+        id="yt-raw-2",
+        creator="MrBeast",
+        source_platform="youtube",
+        source_url="https://youtu.be/dQw4w9WgXcQ",
+    )
+    assert _insert_candidate(full) is True
+    # Same video, different URL shape → no-op insert.
+    assert _insert_candidate(short) is False
+    with sqlite3.connect(migrated_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM clips_candidate").fetchone()[0]
+    assert count == 1

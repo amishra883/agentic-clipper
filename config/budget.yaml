@@ -66,6 +66,18 @@ per_clip_caps:
   seedance_cost_usd_max_pro: 4.00     # hero shot escalation ceiling
   elevenlabs_cost_usd_max: 1.00       # only on threshold escalation
 
+# Per-call / per-day caps for paid APIs.
+# - Curator reads anthropic_daily_usd_max as the per-day ceiling for
+#   LLM tiebreaker calls. monthly cap comes from the line_items block.
+# - Visuals reads atlas_cloud_daily_usd_max (added during the Codex
+#   challenge fixes 2026-05-18).
+per_call_caps:
+  anthropic_daily_usd_max: 3.0        # ~100 tiebreaker calls/day at $0.03 each
+  atlas_cloud_daily_usd_max: 5.0      # bounds a single bad day to ~10% of monthly cap
+  elevenlabs_daily_usd_max: 1.50      # selective escalation hard daily ceiling
+  anthropic_tokens_per_clip_max: 8000 # Writer rewrite-loop bound, not Curator
+  rewrite_loop_max_iterations: 3
+
 # Virality threshold for Seedance Pro promotion (read by Curator + Visuals)
 pro_tier_promotion:
   curator_score_min: 0.85

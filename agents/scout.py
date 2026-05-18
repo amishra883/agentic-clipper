@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, unquote, urlparse
 
 from agents.config import load
 from agents.db import connect
@@ -32,43 +34,198 @@ from agents.retry import retry_external
 NO_FRESH_SOURCE_ALERT_DAYS = 30
 
 
-# ---------- source_url validation (E-14) ----------
+# ---------- source_url canonicalization (E-14 + canonical-id collision) ----------
+#
+# Codex 2026-05-18 findings (empirically verified):
+#   `https://twitch.tv/foo%3Brm%20-rf%20/` PASSED the regex (encoded ;)
+#   `https://www.youtube.com/watch?v=X` vs `https://youtu.be/X` produced
+#   DIFFERENT clip_ids despite being the same video.
+#
+# Fixes (this block):
+#   1. urllib.parse + unquote + IDNA — decode the URL before validation
+#      so encoded shell metacharacters and path traversal don't slip
+#      through.
+#   2. Per-platform canonical URL extraction — same YouTube video at
+#      youtube.com/watch?v=X / youtu.be/X / youtube.com/shorts/X
+#      collapses to one canonical form. UNIQUE(source_url) now actually
+#      de-duplicates.
 
-# Per-platform URL allowlists. Reject anything that doesn't match. The
-# regexes deliberately allow only the canonical hostnames + safe path
-# characters; anything else (shell metacharacters, traversal, weird
-# protocols) gets rejected before it could reach yt-dlp's subprocess.
-_URL_ALLOWLIST: dict[str, re.Pattern[str]] = {
-    "twitch":    re.compile(r"^https://(www\.|clips\.)?twitch\.tv/[\w\-/?=&%]+$"),
-    "youtube":   re.compile(r"^https://(www\.)?(youtube\.com|youtu\.be)/[\w\-/?=&%.]+$"),
-    "tiktok":    re.compile(r"^https://(www\.)?tiktok\.com/@?[\w\-/?=&%.]+$"),
-    "instagram": re.compile(r"^https://(www\.)?instagram\.com/[\w\-/?=&%.]+$"),
-    "kick":      re.compile(r"^https://(www\.)?kick\.com/[\w\-/?=&%.]+$"),
+# Shell metacharacters that, if decoded, would be dangerous to pass to
+# yt-dlp via subprocess. Reject in decoded path/query.
+_DECODED_DANGEROUS_CHARS = re.compile(r"[;|&$<>`\n\r\t\x00\\]")
+
+# Path-traversal in decoded path.
+_PATH_TRAVERSAL = re.compile(r"(^|/)\.\.(/|$)")
+
+# Per-platform allowed host set. Compared case-insensitively after IDNA.
+_HOST_ALLOWLIST: dict[str, set[str]] = {
+    "twitch":    {"twitch.tv", "www.twitch.tv", "clips.twitch.tv", "m.twitch.tv"},
+    "youtube":   {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+    "tiktok":    {"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com"},
+    "instagram": {"instagram.com", "www.instagram.com", "m.instagram.com"},
+    "kick":      {"kick.com", "www.kick.com"},
 }
+
+# YouTube video_id is `[A-Za-z0-9_-]{11}` per the spec.
+_YT_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# Twitch clip slug shape: title-cased words joined by hyphens.
+_TWITCH_CLIP_SLUG = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
 
 
 class InvalidSourceUrlError(ValueError):
-    """Raised when a source_url fails the platform allowlist."""
+    """Raised when a source_url fails canonicalization."""
+
+
+def _idna_host(raw_host: str) -> str:
+    """IDNA-encode the host and lowercase. Unicode confusables (e.g.,
+    Cyrillic 'h' that looks like Latin 'h' — `twitchһ.tv`) either get
+    normalized to their punycode form (which fails the allowlist) or
+    raise UnicodeError outright."""
+    try:
+        return raw_host.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise InvalidSourceUrlError(f"host {raw_host!r} fails IDNA encoding: {exc}")
+
+
+def _reject_dangerous_decoded(decoded: str, context: str) -> None:
+    """After URL-decoding the path+query, look for shell metacharacters
+    or path traversal. Raises on any hit."""
+    m = _DECODED_DANGEROUS_CHARS.search(decoded)
+    if m:
+        raise InvalidSourceUrlError(
+            f"decoded {context} contains shell metacharacter "
+            f"{m.group(0)!r} at position {m.start()}: {decoded[:80]!r}"
+        )
+    if _PATH_TRAVERSAL.search(decoded):
+        raise InvalidSourceUrlError(
+            f"decoded {context} contains path-traversal segment '..': {decoded[:80]!r}"
+        )
+
+
+def _canonical_youtube(parsed) -> str:
+    """Collapse every YouTube URL shape to https://www.youtube.com/watch?v=<id>.
+
+    Supports: /watch?v=ID, youtu.be/ID, /shorts/ID, /embed/ID. Each yields
+    the same canonical string for the same video, so UNIQUE(source_url)
+    catches duplicate inserts."""
+    host = parsed.hostname or ""
+    path = parsed.path or ""
+    video_id = ""
+    if host == "youtu.be":
+        video_id = path.lstrip("/").split("/")[0]
+    elif path == "/watch":
+        qs = parse_qs(parsed.query)
+        video_id = (qs.get("v") or [""])[0]
+    elif path.startswith("/shorts/"):
+        video_id = path[len("/shorts/"):].split("/")[0]
+    elif path.startswith("/embed/"):
+        video_id = path[len("/embed/"):].split("/")[0]
+    if not _YT_VIDEO_ID.match(video_id):
+        raise InvalidSourceUrlError(
+            f"could not extract a valid 11-char YouTube video_id from "
+            f"host={host!r} path={path!r}; got {video_id!r}"
+        )
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _canonical_twitch(parsed) -> str:
+    """Collapse Twitch URLs:
+      clips.twitch.tv/<SLUG>            → https://clips.twitch.tv/<SLUG>
+      twitch.tv/<ch>/clip/<SLUG>        → https://clips.twitch.tv/<SLUG>
+      twitch.tv/videos/<NUMERIC_ID>     → kept as-is (VOD, different shape)
+    """
+    host = parsed.hostname or ""
+    path = parsed.path or ""
+    slug = ""
+    if host == "clips.twitch.tv":
+        slug = path.lstrip("/").split("/")[0]
+    elif "/clip/" in path:
+        slug = path.split("/clip/", 1)[1].split("/")[0]
+    elif "/videos/" in path:
+        vod_id = path.split("/videos/", 1)[1].split("/")[0]
+        if not vod_id.isdigit():
+            raise InvalidSourceUrlError(
+                f"twitch VOD path expects numeric id; got {vod_id!r}"
+            )
+        return f"https://www.twitch.tv/videos/{vod_id}"
+    if not slug or not _TWITCH_CLIP_SLUG.match(slug):
+        raise InvalidSourceUrlError(
+            f"could not extract a valid Twitch clip slug from "
+            f"host={host!r} path={path!r}; got {slug!r}"
+        )
+    return f"https://clips.twitch.tv/{slug}"
+
+
+def _canonical_generic(parsed, allowed_hosts: set[str]) -> str:
+    """For TikTok/Instagram/Kick — no strict id extractor yet. Strip
+    query + fragment + canonicalize host casing. De-dupes trivial
+    variants (e.g., ?utm_source= on a TikTok URL)."""
+    host = (parsed.hostname or "").lower()
+    if host not in allowed_hosts:
+        raise InvalidSourceUrlError(f"host {host!r} not in allowlist {allowed_hosts}")
+    canonical_host = sorted(allowed_hosts, key=len)[0]
+    path = parsed.path or "/"
+    return f"https://{canonical_host}{path}"
+
+
+def canonicalize_source_url(platform: SourcePlatform, url: str) -> str:
+    """Validate + canonicalize. Returns the form Scout stores in
+    `clips_candidate.source_url` and `make_clip_id` derives from.
+
+    Raises InvalidSourceUrlError on:
+      - scheme != https
+      - host not in allowlist (IDNA-normalized; rejects Unicode confusables)
+      - decoded path/query has shell metachars or `../`
+      - platform canonical extraction fails (missing video_id / clip slug)
+    """
+    if not isinstance(url, str) or len(url) > 2048:
+        raise InvalidSourceUrlError(
+            f"url not a str or exceeds 2KB: type={type(url).__name__}"
+        )
+    if platform not in _HOST_ALLOWLIST:
+        raise InvalidSourceUrlError(f"unknown platform: {platform!r}")
+
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise InvalidSourceUrlError(f"urlparse failed: {exc}")
+
+    if parsed.scheme != "https":
+        raise InvalidSourceUrlError(
+            f"scheme must be https; got {parsed.scheme!r} in {url[:80]!r}"
+        )
+
+    raw_host = parsed.hostname or ""
+    if not raw_host:
+        raise InvalidSourceUrlError(f"missing host in {url[:80]!r}")
+    canonical_host = _idna_host(raw_host)
+    allowed = _HOST_ALLOWLIST[platform]
+    if canonical_host not in allowed:
+        raise InvalidSourceUrlError(
+            f"host {canonical_host!r} not in {platform} allowlist {allowed}"
+        )
+    parsed = parsed._replace(netloc=canonical_host)
+
+    # The bit the old regex missed: decode percent-encoding and check the
+    # DECODED bytes for shell metacharacters and traversal. Otherwise
+    # `%3B` (encoded `;`) sails through.
+    decoded_path = unquote(parsed.path or "")
+    _reject_dangerous_decoded(decoded_path, "path")
+    if parsed.query:
+        decoded_query = unquote(parsed.query)
+        _reject_dangerous_decoded(decoded_query, "query")
+
+    if platform == "youtube":
+        return _canonical_youtube(parsed)
+    if platform == "twitch":
+        return _canonical_twitch(parsed)
+    return _canonical_generic(parsed, allowed)
 
 
 def _validate_source_url(platform: SourcePlatform, url: str) -> None:
-    """Reject URLs that don't match the platform's regex.
-
-    The regex is the security boundary: Scout's input comes from scraped
-    HTML and external API responses (attacker-influenced text). If a
-    malicious URL slipped through, Phase 2's yt-dlp wrapper could be
-    coerced into shell injection or path traversal. Validating at insert
-    time means a bad URL never makes it into `clips_candidate`.
-    """
-    pattern = _URL_ALLOWLIST.get(platform)
-    if pattern is None:
-        raise InvalidSourceUrlError(f"unknown platform: {platform!r}")
-    if not pattern.match(url):
-        raise InvalidSourceUrlError(
-            f"source_url {url!r} does not match the {platform!r} allowlist regex. "
-            "URLs from scraped sources must match the canonical platform format; "
-            "metacharacters and non-platform domains are rejected at insert."
-        )
+    """Back-compat shim: canonicalize and discard. Raises on invalid input."""
+    canonicalize_source_url(platform, url)
 
 
 # ---------- Source-platform clients (Phase 2 wiring) ----------
@@ -163,15 +320,21 @@ def _check_fresh_source(creator: str, latest_seen_at: datetime | None) -> None:
 
 
 def _insert_candidate(clip: CandidateClip) -> bool:
-    """Insert (or skip-if-exists). Returns True if a new row was inserted.
+    """Canonicalize source_url, derive clip_id from the canonical form,
+    INSERT OR IGNORE. Returns True iff a new row was inserted.
 
-    Validates source_url against the platform allowlist before insert; if
-    validation fails, raises InvalidSourceUrlError and does NOT write
-    a row. The UNIQUE(source_url) index (migration v5) is the structural
-    backstop — even if validation is bypassed, two inserts for the same
-    URL would fail at the DB layer.
+    Why canonicalize before insert: youtube.com/watch?v=X and youtu.be/X
+    are the same video. If Scout stores both raw, they'd produce two
+    rows with two different clip_ids (the UNIQUE constraint on
+    source_url only catches byte-for-byte duplicates). Canonicalizing
+    BEFORE storage means both inputs collapse to the same source_url,
+    the same clip_id, and UNIQUE actually de-duplicates.
+
+    Raises InvalidSourceUrlError if canonicalization fails — does NOT
+    write a row in that case.
     """
-    _validate_source_url(clip.source_platform, clip.source_url)
+    canonical_url = canonicalize_source_url(clip.source_platform, clip.source_url)
+    canonical_id = make_clip_id(clip.source_platform, canonical_url)
     with connect() as conn:
         cur = conn.execute(
             """
@@ -181,16 +344,15 @@ def _insert_candidate(clip: CandidateClip) -> bool:
             VALUES (?, ?, ?, ?, ?, ?, ?, 'discovered')
             """,
             (
-                clip.id,
+                canonical_id,
                 clip.creator,
                 clip.source_platform,
-                clip.source_url,
+                canonical_url,
                 clip.source_title,
                 clip.source_duration_s,
                 clip.source_view_count,
             ),
         )
-        # rowcount=1 → newly inserted; rowcount=0 → already existed (id OR url collision)
         return cur.rowcount == 1
 
 
