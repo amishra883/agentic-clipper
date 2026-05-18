@@ -31,7 +31,6 @@ Calling pattern
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -385,46 +384,61 @@ def _build_auto_changes(conn: sqlite3.Connection) -> list[AutoChange]:
     ]
 
 
+_ACTION_DISPLAY_CAP = 3
+
+
 def _build_actions(
     alerts: list[Alert],
     manual_queue: list[ManualQueueItem],
 ) -> list[Action]:
     """Top 3 things the operator should do today. Promotion rules:
-      - Red alerts always make the action list
-      - Manual queue is a single rolled-up action if non-empty
-      - Amber alerts promote only if there's headroom in the top-3
+      - Red alerts always make the action list, ordered first
+      - Manual queue is a single rolled-up action
+      - Amber alerts fill remaining slots
+      - If >3 reds exist, the cap shows the first 3 PLUS a "N more red
+        alerts" spillover action so the operator knows to scroll
+
+    Codex finding 2026-05-18: the prior `actions[:3]` truncation could
+    discard red alerts beyond #3. Red alerts must never disappear from
+    the operator's view; we now show them all in the ALERTS section
+    (the truncation only affects the WHAT NEEDS YOU summary), AND we
+    surface a spillover marker if reds exceed the display cap.
     """
-    actions: list[Action] = []
-
-    # Red alerts first
-    for a in alerts:
-        if a.severity == "red":
-            actions.append(Action(
-                priority=1,
-                title=a.title,
-                detail=a.detail,
-            ))
-
-    # Manual queue, if non-empty
+    reds = [Action(priority=1, title=a.title, detail=a.detail)
+            for a in alerts if a.severity == "red"]
+    queue_action = None
     if manual_queue:
         platforms = sorted({m.platform for m in manual_queue})
-        actions.append(Action(
+        queue_action = Action(
             priority=2,
             title=f"Post {len(manual_queue)} clip(s) manually",
             detail=f"Platforms: {', '.join(platforms)}. Drop dirs ready.",
             command="make tiktok-flow",
-        ))
+        )
+    ambers = [Action(priority=3, title=a.title, detail=a.detail)
+              for a in alerts if a.severity == "amber"]
 
-    # Amber alerts fill remaining slots
-    for a in alerts:
-        if a.severity == "amber" and len(actions) < 3:
-            actions.append(Action(
-                priority=3,
-                title=a.title,
-                detail=a.detail,
-            ))
+    # If reds alone exceed the cap, show the first (cap-1) reds PLUS a
+    # spillover action — operator sees N total reds existed.
+    if len(reds) >= _ACTION_DISPLAY_CAP:
+        keep = reds[:_ACTION_DISPLAY_CAP - 1]
+        overflow = len(reds) - (_ACTION_DISPLAY_CAP - 1)
+        spillover = Action(
+            priority=1,
+            title=f"{overflow} more red alert(s) above — review ALERTS section",
+            detail="Action list capped; scroll up for the full ALERTS list.",
+        )
+        return keep + [spillover]
 
-    return actions[:3]
+    # Normal case: reds (≤cap-1) + queue + ambers, truncated to cap
+    out: list[Action] = list(reds)
+    if queue_action is not None and len(out) < _ACTION_DISPLAY_CAP:
+        out.append(queue_action)
+    for a in ambers:
+        if len(out) >= _ACTION_DISPLAY_CAP:
+            break
+        out.append(a)
+    return out[:_ACTION_DISPLAY_CAP]
 
 
 # ---------- Public entrypoint ----------

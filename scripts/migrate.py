@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import sqlite3
 import sys
 import time
@@ -125,7 +124,16 @@ def pending(migrations: list[Migration], current: int) -> list[Migration]:
 
 
 def backup_db(db_path: Path) -> Path | None:
-    """Copy data/main.db to data/main.db.bak.<ts> before the first apply.
+    """Snapshot data/main.db to data/main.db.bak.<ts> before the first apply.
+
+    Codex finding 2026-05-18: under SQLite WAL, `shutil.copy2` only copies
+    the main DB file — the WAL file (`-wal` sibling) holds recent committed
+    writes that haven't checkpointed yet. The resulting .bak could be
+    missing data, making it unusable as a rollback target.
+
+    Fix: use SQLite's online backup API. It walks both the main DB pages
+    AND any pending WAL frames, producing a consistent snapshot regardless
+    of WAL state, while the source remains open for concurrent reads.
 
     Returns the backup path, or None if there's no DB to back up yet.
     """
@@ -133,7 +141,19 @@ def backup_db(db_path: Path) -> Path | None:
         return None
     ts = time.strftime("%Y%m%d-%H%M%S")
     backup_path = db_path.with_suffix(f".db.bak.{ts}")
-    shutil.copy2(db_path, backup_path)
+    src = sqlite3.connect(db_path)
+    try:
+        dst = sqlite3.connect(backup_path)
+        try:
+            # pages=-1 streams the full DB in one call; SQLite's backup API
+            # handles WAL automatically (per the sqlite3 docs: the backup
+            # operation produces a "consistent snapshot" even with active
+            # writers on the source).
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
     return backup_path
 
 

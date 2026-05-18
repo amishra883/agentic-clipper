@@ -60,6 +60,20 @@ class LeaseConflict(Exception):
     (clip_id, stage). Caller decides whether to retry or skip."""
 
 
+class StaleArtifactVersion(Exception):
+    """Raised when a lease tries to bump artifact_version but the row's
+    current version is already past what we read at lease start. Means
+    another stage raced ahead between our read and write — our output
+    is stale and must not land.
+
+    Codex finding 2026-05-18: previously the bump silently no-op'd on a
+    rowcount=0 UPDATE; the lease still marked succeeded with the (now
+    stale) input_artifact_version. Compliance downstream would consume
+    artifacts whose version pointer was wrong. This exception forces
+    the caller to handle the race instead of silently committing bad
+    state."""
+
+
 @dataclass
 class Lease:
     """Live lease handle. Caller mutates `output_artifact_version` before
@@ -227,10 +241,11 @@ def _mark_done(
                 if row is not None:
                     # Conditional UPDATE: only bump if the artifact_version
                     # we read at lease-start is still the current version.
-                    # If another stage raced ahead, our output is stale —
-                    # skip the bump and let the caller's exception handler
-                    # (if any) discover the race.
-                    conn.execute(
+                    # Race semantics (Codex 2026-05-18): if rowcount != 1
+                    # the CAS lost — another stage raced ahead and bumped
+                    # past our input_version while we were running. Our
+                    # output is stale; do not silently commit it.
+                    cur = conn.execute(
                         """
                         UPDATE clip_artifacts
                            SET artifact_version = ?
@@ -239,6 +254,30 @@ def _mark_done(
                         """,
                         (output_version, row["clip_id"], output_version - 1),
                     )
+                    if cur.rowcount != 1:
+                        # Mark the run failed (we're inside a transaction
+                        # that will COMMIT in a moment; need to flip the
+                        # run row's status from succeeded → failed AND
+                        # then ROLLBACK to undo everything, since the
+                        # caller's `with` body believed it succeeded).
+                        conn.execute("ROLLBACK")
+                        # Re-mark the run as failed in a separate transaction
+                        # so the audit trail records what happened.
+                        with connect() as fail_conn:
+                            fail_conn.execute(
+                                """
+                                UPDATE pipeline_runs
+                                   SET status = 'failed',
+                                       failure_reason = 'stale_artifact_version',
+                                       completed_at = datetime('now')
+                                 WHERE id = ?
+                                """,
+                                (run_id,),
+                            )
+                        raise StaleArtifactVersion(
+                            f"stage {row['clip_id']} ran on artifact_version={output_version - 1} "
+                            f"but DB already moved past that. Output discarded."
+                        )
             conn.execute("COMMIT")
         except Exception:
             try:

@@ -13,7 +13,6 @@ import pytest
 
 from agents.eval_runner import (
     DEFAULT_SIMILARITY_THRESHOLD,
-    EvalCase,
     character_jaccard,
     load_eval_cases,
     run_eval_suite,
@@ -45,6 +44,25 @@ def test_jaccard_is_case_insensitive():
 
 def test_jaccard_one_empty_scores_zero():
     assert character_jaccard("abc", "") == 0.0
+
+
+def test_jaccard_rejects_same_alphabet_different_words():
+    """Codex 2026-05-18 fix: previously character_jaccard scored "abc def"
+    and "fed cba" as 1.0 because the character sets were identical. Word-
+    token Jaccard scores them at 0.0 — different word content."""
+    a = "the clutch moment was unreal"
+    b = "absurd kotlin language behaves"  # mostly disjoint word set
+    # Character-set Jaccard would be high (most letters appear in both).
+    # Word Jaccard sees the actual content differs.
+    assert character_jaccard(a, b) < 0.2
+
+
+def test_jaccard_passes_reordered_same_words():
+    """Same words, different order, should still score high — persona
+    stability cares about content overlap, not exact phrasing."""
+    a = "the clutch moment was unreal"
+    b = "unreal was the moment clutch"
+    assert character_jaccard(a, b) == 1.0
 
 
 # ---------- Suite loader ----------

@@ -100,12 +100,39 @@ def test_pending_excludes_already_applied():
 # ---------- backup_db ----------
 
 def test_backup_creates_timestamped_copy(fresh_db):
+    """Backup must produce a valid SQLite DB containing the same schema +
+    rows as the source. Byte-equality is NOT required (the SQLite online
+    backup API produces a fresh page layout, intentionally — that's what
+    makes it WAL-safe vs `shutil.copy2`)."""
     backup = migrate_mod.backup_db(fresh_db)
     assert backup is not None
     assert backup.exists()
     assert ".bak." in backup.name
-    # Backup contents identical to source
-    assert backup.read_bytes() == fresh_db.read_bytes()
+
+    # Open both as SQLite and verify equivalent schema_version contents
+    with sqlite3.connect(fresh_db) as src_conn:
+        src_rows = src_conn.execute(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall()
+    with sqlite3.connect(backup) as bak_conn:
+        bak_rows = bak_conn.execute(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall()
+    assert src_rows == bak_rows, "backup schema_version differs from source"
+
+    # Verify all tables present in source are present in backup
+    with sqlite3.connect(fresh_db) as src_conn:
+        src_tables = {r[0] for r in src_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+    with sqlite3.connect(backup) as bak_conn:
+        bak_tables = {r[0] for r in bak_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+    assert src_tables == bak_tables, (
+        f"backup tables differ: missing {src_tables - bak_tables}, "
+        f"extra {bak_tables - src_tables}"
+    )
 
 
 def test_backup_returns_none_when_no_db(tmp_path):

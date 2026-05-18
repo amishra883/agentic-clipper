@@ -82,9 +82,19 @@ _INJECTION_PATTERNS = [
     re.compile(r"!\[[^\]]*\]\(\s*https?://", re.IGNORECASE),
 ]
 
-# Maximum entries we accept per category, to bound LLM context cost and
-# limit blast radius if a single entry slips a check.
-_MAX_ENTRIES_PER_FRESHNESS = 30
+# Maximum VALID entries we accept per category — what reaches the LLM.
+# Set deliberately low to bound LLM context cost and limit blast radius
+# if a single entry slips a check.
+_MAX_VALID_ENTRIES_PER_FRESHNESS = 30
+
+# Maximum entries we WILL SCAN per category, regardless of validity.
+# This is the attacker-padding defense (Codex 2026-05-18): if the cap
+# applied to raw entries before validation, an attacker could pad 30
+# invalid entries ahead of legitimate refs, getting 0 valid through.
+# Separating the two caps means: we collect up to 30 VALID refs from
+# up to 200 scanned entries. Bounds CPU; doesn't let attackers starve
+# the LLM of valid trending input.
+_MAX_SCAN_PER_FRESHNESS = 200
 
 
 @dataclass
@@ -214,17 +224,40 @@ def sanitize_trending_text(text: str) -> SanitizeOutcome:
         if not isinstance(section, list):
             outcome.rejected.append((freshness_label, f"section-not-list: {type(section).__name__}"))
             continue
-        # Cap per-section to limit LLM-context blast radius
-        for raw in section[:_MAX_ENTRIES_PER_FRESHNESS]:
+
+        # Two caps (Codex 2026-05-18):
+        #   - _MAX_VALID: how many valid refs reach the LLM
+        #   - _MAX_SCAN:  how many raw entries we'll examine, regardless
+        # An attacker padding with N invalid entries doesn't starve out
+        # valid ones until we hit the scan cap. Bounds CPU AND defeats
+        # the padding attack.
+        scanned = 0
+        valid_count_before = len(outcome.refs)
+        for raw in section[:_MAX_SCAN_PER_FRESHNESS]:
+            scanned += 1
+            # Count valid refs ADDED for this freshness so far
+            current_valid = len(outcome.refs) - valid_count_before
+            if current_valid >= _MAX_VALID_ENTRIES_PER_FRESHNESS:
+                # Hit the valid cap; remaining entries don't reach the LLM
+                # but we still record over-cap as a rejection for audit.
+                remaining = len(section[:_MAX_SCAN_PER_FRESHNESS]) - scanned + 1
+                if remaining > 0:
+                    outcome.rejected.append(
+                        (freshness_label, f"valid-cap-reached-skipped-{remaining}-remaining")
+                    )
+                break
             ref, reason = _sanitize_entry(raw, freshness_label)  # type: ignore[arg-type]
             if ref is not None:
                 outcome.refs.append(ref)
             else:
                 outcome.rejected.append((repr(raw)[:120], reason or "unknown"))
-        # Note over-cap entries as a single rejection for audit visibility
-        if len(section) > _MAX_ENTRIES_PER_FRESHNESS:
-            extras = len(section) - _MAX_ENTRIES_PER_FRESHNESS
-            outcome.rejected.append((freshness_label, f"over-cap-by-{extras}-entries"))
+
+        # Audit: did we hit the scan cap (attacker padded heavily)?
+        if len(section) > _MAX_SCAN_PER_FRESHNESS:
+            extras = len(section) - _MAX_SCAN_PER_FRESHNESS
+            outcome.rejected.append(
+                (freshness_label, f"scan-cap-reached-skipped-{extras}-raw-entries")
+            )
 
     return outcome
 

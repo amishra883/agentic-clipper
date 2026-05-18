@@ -46,7 +46,6 @@ the contract above does not change.
 from __future__ import annotations
 
 import hashlib
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -69,15 +68,40 @@ def detect_music_in_segment(
     start_s: float,
     end_s: float,
     *,
-    method: DetectorMethod = "placeholder-energy",
+    method: DetectorMethod | None = None,
+    allow_unsafe_placeholder: bool = False,
 ) -> MusicDetectionResult:
     """Public entrypoint. Caller (Editor) gets the result + writes the
     boolean to clip_artifacts.has_music_in_source_segment.
 
-    Phase 1: only the placeholder dispatches. Phase 2 swap-in adds the
-    real implementations; the calling code at the Editor layer never
-    changes because the contract is fixed here.
+    SAFETY GATE (Codex finding 2026-05-18):
+        `method=None` (the default) raises. Callers must explicitly choose
+        a detector. The placeholder-energy detector returns has_music=False
+        on ~75% of files based on a hash of (path, segment) — using it as
+        a silent default would feed false "no music" evidence into the
+        Compliance gate, which is the exact failure mode E-6 exists to
+        prevent. Phase 2's Editor must wire a real detector OR explicitly
+        opt into the placeholder with `allow_unsafe_placeholder=True`
+        (test harnesses only).
+
+        The placeholder check requires `allow_unsafe_placeholder=True`
+        so a stray test fixture cannot slip into production use; tests
+        pass the flag, production code does not.
     """
+    if method is None:
+        raise ValueError(
+            "music_detector: no method specified. Production code must pass a real "
+            "detector method (Phase 2: 'panns-tagging' / 'spectral-bandwidth'). "
+            "Test code may pass method='placeholder-energy' AND "
+            "allow_unsafe_placeholder=True."
+        )
+    if method == "placeholder-energy" and not allow_unsafe_placeholder:
+        raise ValueError(
+            "music_detector: placeholder-energy is not safe for production use "
+            "(returns False on ~75% of files via deterministic hash, not real "
+            "audio analysis). Pass allow_unsafe_placeholder=True from test code."
+        )
+
     if not audio_path.exists():
         return MusicDetectionResult(
             has_music=True,  # fail-CLOSED: assume music if we can't even read the file
@@ -147,34 +171,73 @@ def evaluate_detector(
     fixtures_root: Path,
     *,
     method: DetectorMethod = "placeholder-energy",
+    allow_unsafe_placeholder: bool = True,
 ) -> dict:
     """Run the detector against every fixture and return precision/recall.
 
-    Used by `tests/test_music_detection_harness.py` to assert the floor
-    (≥95% precision / ≥90% recall) once a real detector ships. With the
-    placeholder, the test just verifies the harness is wired — it does
-    NOT enforce the floor (the placeholder is not the detector under
-    evaluation).
+    SAFETY (Codex finding 2026-05-18): preflight every fixture path.
+    Without preflight, missing audio files trip the fail-closed path
+    inside `detect_music_in_segment` (returns has_music=True). If the
+    fixture set is all has_music=True labels and all files are missing,
+    every result is a TP and precision/recall reports 1.0 — fake perfect
+    score on zero real audio. Preflight makes this impossible to fake.
+
+    Also requires labels to be balanced (≥1 positive AND ≥1 negative)
+    so precision and recall both have non-zero denominators. An all-
+    positive set would yield recall=N/N=1.0 and undefined precision
+    (no FPs possible) — misleading.
 
     Definitions:
       - TP: ground-truth music AND detector says music
       - FP: ground-truth no-music AND detector says music
       - FN: ground-truth music AND detector says no-music
       - TN: ground-truth no-music AND detector says no-music
-      - Precision = TP / (TP + FP) — of clips we said had music, how many actually did?
-      - Recall    = TP / (TP + FN) — of clips that actually had music, how many did we catch?
+      - Precision = TP / (TP + FP)
+      - Recall    = TP / (TP + FN)
 
     Compliance cares about recall MORE than precision: a false negative
     means a music-laced clip ships → Content ID strike. A false positive
     means a music-free clip is needlessly quarantined → operator workload
     but no legal risk.
     """
+    # Preflight: every fixture path must exist. Empty fixture list is OK
+    # (caller's xfail handles the "no fixtures yet" framework case).
+    missing_paths: list[str] = []
+    for fx in fixtures:
+        audio_path = fixtures_root / fx.relative_path
+        if not audio_path.exists():
+            missing_paths.append(fx.relative_path)
+    if missing_paths:
+        raise FileNotFoundError(
+            f"evaluate_detector preflight: {len(missing_paths)} fixture file(s) "
+            f"missing under {fixtures_root}: {missing_paths[:5]}"
+            + (f" ... ({len(missing_paths) - 5} more)" if len(missing_paths) > 5 else "")
+        )
+
+    # Require label balance so precision and recall both have meaning.
+    if fixtures:
+        positives = sum(1 for fx in fixtures if fx.has_music)
+        negatives = len(fixtures) - positives
+        if positives == 0:
+            raise ValueError(
+                "evaluate_detector: fixture set has zero positive labels "
+                "(has_music=True). Recall is undefined; add some music fixtures."
+            )
+        if negatives == 0:
+            raise ValueError(
+                "evaluate_detector: fixture set has zero negative labels "
+                "(has_music=False). Precision can't catch false positives; add "
+                "some no-music fixtures."
+            )
+
     tp = fp = fn = tn = 0
     per_fixture = []
     for fx in fixtures:
         audio_path = fixtures_root / fx.relative_path
         result = detect_music_in_segment(
-            audio_path, fx.start_s, fx.end_s, method=method
+            audio_path, fx.start_s, fx.end_s,
+            method=method,
+            allow_unsafe_placeholder=allow_unsafe_placeholder,
         )
         predicted = result.has_music
         actual = fx.has_music

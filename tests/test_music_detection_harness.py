@@ -29,7 +29,6 @@ import pytest
 
 from agents.music_detector import (
     FixtureLabel,
-    MusicDetectionResult,
     detect_music_in_segment,
     evaluate_detector,
     load_fixture_manifest,
@@ -48,8 +47,16 @@ RECALL_FLOOR = 0.90
 def test_detect_returns_fail_closed_on_missing_file(tmp_path):
     """Missing audio file → has_music=True (fail-closed). The point of
     the detector is to prevent Content ID strikes; an absent file is the
-    same as an unverifiable file, which the gate should reject."""
-    result = detect_music_in_segment(tmp_path / "nope.wav", 0.0, 30.0)
+    same as an unverifiable file, which the gate should reject.
+
+    Pass `allow_unsafe_placeholder=True` because the placeholder method
+    requires explicit opt-in (Codex finding 2026-05-18: prior default
+    made it production-callable, which would feed false "no music"
+    evidence into Compliance)."""
+    result = detect_music_in_segment(
+        tmp_path / "nope.wav", 0.0, 30.0,
+        method="placeholder-energy", allow_unsafe_placeholder=True,
+    )
     assert result.has_music is True
     assert "missing" in result.notes
 
@@ -59,27 +66,46 @@ def test_detect_returns_fail_closed_on_invalid_segment(tmp_path):
     otherwise quietly score zero-length segments."""
     fake = tmp_path / "fake.wav"
     fake.write_bytes(b"dummy")  # detector won't read it; just needs to exist
-    result = detect_music_in_segment(fake, 30.0, 30.0)
+    result = detect_music_in_segment(
+        fake, 30.0, 30.0,
+        method="placeholder-energy", allow_unsafe_placeholder=True,
+    )
     assert result.has_music is True
     assert "invalid segment" in result.notes
 
 
+def test_detect_no_method_raises():
+    """Production-safety gate: method=None raises so production code can't
+    silently use the placeholder."""
+    fake_path = REPO_ROOT / "agents" / "music_detector.py"
+    with pytest.raises(ValueError, match="no method specified"):
+        detect_music_in_segment(fake_path, 0.0, 1.0)
+
+
+def test_detect_placeholder_requires_opt_in():
+    """Production-safety gate: even with method='placeholder-energy', the
+    caller must pass allow_unsafe_placeholder=True. Editor would NEVER do
+    that — that's the defense."""
+    fake_path = REPO_ROOT / "agents" / "music_detector.py"
+    with pytest.raises(ValueError, match="placeholder-energy is not safe"):
+        detect_music_in_segment(fake_path, 0.0, 1.0, method="placeholder-energy")
+
+
 def test_unknown_method_raises():
-    """The dispatch only knows placeholder-energy in Phase 1. Asking for
-    panns-tagging surfaces a clear NotImplementedError instead of a silent
-    pass-through."""
-    fake_path = REPO_ROOT / "agents" / "music_detector.py"  # any existing file
+    """Asking for a Phase 2 method surfaces a clear NotImplementedError."""
+    fake_path = REPO_ROOT / "agents" / "music_detector.py"
     with pytest.raises(NotImplementedError, match="not yet wired"):
         detect_music_in_segment(fake_path, 0.0, 1.0, method="panns-tagging")
 
 
 def test_evaluate_detector_returns_complete_shape():
-    """Synthetic fixture set; harness machinery returns the right dict."""
+    """Synthetic fixture set; harness machinery returns the right dict.
+    Use REAL files (the agents/ modules) so preflight passes; balance
+    positive + negative labels so the harness doesn't raise on imbalance."""
     fixtures = [
-        FixtureLabel(relative_path="any.wav", start_s=0.0, end_s=30.0, has_music=True),
-        FixtureLabel(relative_path="any.wav", start_s=0.0, end_s=30.0, has_music=False),
+        FixtureLabel(relative_path="music_detector.py", start_s=0.0, end_s=30.0, has_music=True),
+        FixtureLabel(relative_path="compliance.py",    start_s=0.0, end_s=30.0, has_music=False),
     ]
-    # Use a real existing file so the placeholder dispatches (no fail-closed)
     result = evaluate_detector(fixtures, fixtures_root=REPO_ROOT / "agents")
     for key in ("total", "tp", "fp", "fn", "tn", "precision", "recall", "method", "per_fixture"):
         assert key in result, f"missing key {key}"
@@ -88,16 +114,48 @@ def test_evaluate_detector_returns_complete_shape():
     assert result["tp"] + result["fp"] + result["fn"] + result["tn"] == 2
 
 
+def test_evaluate_detector_rejects_missing_fixture():
+    """Codex finding: a missing fixture file would have silently been
+    counted as "fail-closed = True" prediction. If the labels are also
+    True, that's a fake TP, producing fake 100% precision. Preflight
+    now raises before any scoring happens."""
+    fixtures = [
+        FixtureLabel(relative_path="does_not_exist.wav", start_s=0.0, end_s=30.0, has_music=True),
+        FixtureLabel(relative_path="compliance.py",      start_s=0.0, end_s=30.0, has_music=False),
+    ]
+    with pytest.raises(FileNotFoundError, match="preflight"):
+        evaluate_detector(fixtures, fixtures_root=REPO_ROOT / "agents")
+
+
+def test_evaluate_detector_rejects_all_positive_labels():
+    """Recall is meaningless if there are no negatives in the set."""
+    fixtures = [
+        FixtureLabel(relative_path="music_detector.py", start_s=0.0, end_s=30.0, has_music=True),
+        FixtureLabel(relative_path="compliance.py",    start_s=0.0, end_s=30.0, has_music=True),
+    ]
+    with pytest.raises(ValueError, match="zero negative labels"):
+        evaluate_detector(fixtures, fixtures_root=REPO_ROOT / "agents")
+
+
+def test_evaluate_detector_rejects_all_negative_labels():
+    """Precision is meaningless without positives to compare."""
+    fixtures = [
+        FixtureLabel(relative_path="music_detector.py", start_s=0.0, end_s=30.0, has_music=False),
+        FixtureLabel(relative_path="compliance.py",    start_s=0.0, end_s=30.0, has_music=False),
+    ]
+    with pytest.raises(ValueError, match="zero positive labels"):
+        evaluate_detector(fixtures, fixtures_root=REPO_ROOT / "agents")
+
+
 def test_evaluate_detector_classifies_outcomes_correctly():
     """Sanity check the confusion matrix arithmetic against known labels."""
-    fixtures = [FixtureLabel(
-        relative_path="agents/music_detector.py",  # real file relative to REPO_ROOT
-        start_s=0.0, end_s=30.0,
-        has_music=True,
-    )]
-    result = evaluate_detector(fixtures, fixtures_root=REPO_ROOT)
-    # One fixture; counts must sum to one
-    assert sum([result["tp"], result["fp"], result["fn"], result["tn"]]) == 1
+    fixtures = [
+        FixtureLabel(relative_path="music_detector.py", start_s=0.0, end_s=30.0, has_music=True),
+        FixtureLabel(relative_path="compliance.py",    start_s=0.0, end_s=30.0, has_music=False),
+    ]
+    result = evaluate_detector(fixtures, fixtures_root=REPO_ROOT / "agents")
+    # Two fixtures; counts must sum to two
+    assert sum([result["tp"], result["fp"], result["fn"], result["tn"]]) == 2
 
 
 # ---------- Manifest loader ----------

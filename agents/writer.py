@@ -82,10 +82,35 @@ def stale_check() -> bool:
 
 
 def _load_trending() -> str:
-    # TODO(phase2): replace with a parsed structure (Hot / Rising / Cooked).
-    if not TRENDING_PATH.exists():
+    """Load trending refs as a structured, sanitized string for the LLM prompt.
+
+    Closes the gap Codex flagged 2026-05-18: previously this returned raw
+    `data/trending.md` text directly, bypassing the prompt-injection
+    sanitizer added in commit 1af1c5e. The Writer is the chokepoint where
+    scraped Reddit/Twitter/KYM/X text would reach the LLM — that path is
+    now closed.
+
+    The sanitizer (`agents.trending_sanitizer.sanitize_trending_file`)
+    parses only the YAML frontmatter into structured `TrendingRef` records
+    and discards the markdown body. This function serializes those refs
+    into a compact text block the LLM can read; the original file text
+    NEVER reaches the LLM.
+    """
+    from agents.trending_sanitizer import sanitize_trending_file
+    outcome = sanitize_trending_file(TRENDING_PATH)
+    if not outcome.refs:
         return ""
-    return TRENDING_PATH.read_text()
+    lines: list[str] = []
+    for freshness in ("hot", "rising", "cooked"):
+        bucket = [r for r in outcome.refs if r.freshness == freshness]
+        if not bucket:
+            continue
+        lines.append(f"{freshness}:")
+        for ref in bucket:
+            # Structured rendering: kind: value (description if present, source-tagged)
+            desc = f" ({ref.description})" if ref.description else ""
+            lines.append(f"  - {ref.kind}: {ref.value}{desc} [src={ref.source}]")
+    return "\n".join(lines)
 
 
 # ---------- Persona helpers ----------

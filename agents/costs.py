@@ -56,8 +56,36 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from agents.db import connect
+
+# Operator timezone for daily / monthly budget boundaries. The operator's
+# mental model is "midnight ET to midnight ET", not "midnight UTC to midnight
+# UTC". config/posting_schedule.yaml hard-codes America/New_York as the
+# operator default; we use the same here. If a future operator wants a
+# different tz the value flows in from config (Day 3+ wires that).
+_OPERATOR_TZ = ZoneInfo("America/New_York")
+
+
+def _local_now() -> datetime:
+    return datetime.now(_OPERATOR_TZ)
+
+
+def _local_day_start_utc(local_now: datetime | None = None) -> str:
+    """Return today's local-midnight as a UTC ISO string suitable for
+    SQLite comparison via strftime('%s', ...). Used as the daily cap
+    boundary."""
+    local_now = local_now or _local_now()
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_midnight.astimezone(timezone.utc).isoformat(sep=" ", timespec="seconds")
+
+
+def _local_month_start_utc(local_now: datetime | None = None) -> str:
+    """Return the start of the local month as a UTC ISO string."""
+    local_now = local_now or _local_now()
+    local_month_start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return local_month_start.astimezone(timezone.utc).isoformat(sep=" ", timespec="seconds")
 
 
 class BudgetExceeded(Exception):
@@ -93,19 +121,27 @@ class MtdBreakdown:
 def mtd_breakdown(category: str) -> MtdBreakdown:
     """Sum month-to-date costs by status for a single category.
 
+    "Month-to-date" means since the start of THIS calendar month in the
+    operator's timezone (America/New_York), converted to UTC for the
+    `ts` comparison. Codex finding 2026-05-18: using SQLite's bare
+    strftime('%Y-%m', 'now') compares UTC months — an ET-evening expense
+    on the 31st would count toward "next month" because UTC has already
+    rolled over.
+
     Failed rows are excluded from cap math elsewhere but reported here
     for audit visibility. Pending + succeeded is the relevant total.
     """
+    month_start = _local_month_start_utc()
     with connect() as conn:
         rows = conn.execute(
             """
             SELECT status, COALESCE(SUM(amount_usd), 0) AS total
               FROM costs
              WHERE category = ?
-               AND strftime('%Y-%m', ts) = strftime('%Y-%m', 'now')
+               AND strftime('%s', ts) >= strftime('%s', ?)
              GROUP BY status
             """,
-            (category,),
+            (category, month_start),
         ).fetchall()
     out = MtdBreakdown(pending=0.0, succeeded=0.0, failed=0.0)
     for row in rows:
@@ -119,16 +155,21 @@ def mtd_breakdown(category: str) -> MtdBreakdown:
 
 
 def _today_total(conn, category: str) -> float:
-    """Pending + succeeded for today's date (UTC). Used for daily caps."""
+    """Pending + succeeded since the start of today in OPERATOR time
+    (America/New_York), converted to UTC for the ts compare. The previous
+    implementation used SQLite's date('now') (UTC) — daily cap would fire
+    at 8pm ET (00:00 UTC) instead of midnight ET, surprising the operator
+    by 4-5 hours every day."""
+    day_start = _local_day_start_utc()
     row = conn.execute(
         """
         SELECT COALESCE(SUM(amount_usd), 0) AS total
           FROM costs
          WHERE category = ?
            AND status IN ('pending', 'succeeded')
-           AND date(ts) = date('now')
+           AND strftime('%s', ts) >= strftime('%s', ?)
         """,
-        (category,),
+        (category, day_start),
     ).fetchone()
     return float(row["total"]) if row else 0.0
 
@@ -157,19 +198,20 @@ def reserve(
 
     reservation_id = uuid.uuid4().hex
 
+    month_start = _local_month_start_utc()
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # MTD pending + succeeded
+            # MTD pending + succeeded — operator-tz month, not UTC month
             row = conn.execute(
                 """
                 SELECT COALESCE(SUM(CASE WHEN status='pending' THEN amount_usd ELSE 0 END), 0) AS pending,
                        COALESCE(SUM(CASE WHEN status='succeeded' THEN amount_usd ELSE 0 END), 0) AS succeeded
                   FROM costs
                  WHERE category = ?
-                   AND strftime('%Y-%m', ts) = strftime('%Y-%m', 'now')
+                   AND strftime('%s', ts) >= strftime('%s', ?)
                 """,
-                (category,),
+                (category, month_start),
             ).fetchone()
             mtd_pending = float(row["pending"])
             mtd_succeeded = float(row["succeeded"])

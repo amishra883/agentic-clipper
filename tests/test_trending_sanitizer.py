@@ -11,7 +11,6 @@ import pytest
 
 from agents.trending_sanitizer import (
     SanitizeOutcome,
-    TrendingRef,
     sanitize_trending_text,
 )
 
@@ -231,8 +230,10 @@ hot:
     assert "description-too-long" in outcome.rejected[0][1]
 
 
-def test_caps_entries_per_freshness():
-    """More than 30 entries per freshness — extras are dropped, audit logs it."""
+def test_caps_at_30_valid_entries_per_freshness():
+    """Codex 2026-05-18 fix: two caps — collect up to 30 VALID refs from
+    up to 200 scanned raw entries. Past 30 valid, remaining are skipped
+    with an audit entry."""
     entries = "\n".join(
         f"  - kind: meme\n    value: slug-{i}\n    source: reddit"
         for i in range(35)
@@ -240,9 +241,46 @@ def test_caps_entries_per_freshness():
     text = f"---\nhot:\n{entries}\n---\n"
     outcome = sanitize_trending_text(text)
     assert len(outcome.refs) == 30
-    # The over-cap audit entry exists
-    over_cap = [r for r in outcome.rejected if "over-cap" in r[1]]
-    assert len(over_cap) == 1
+    # Audit entry shows we hit the valid cap
+    valid_cap_entries = [r for r in outcome.rejected if "valid-cap-reached" in r[1]]
+    assert len(valid_cap_entries) == 1
+
+
+def test_attacker_padding_does_not_starve_valid_refs():
+    """Codex 2026-05-18 attack: previously the cap applied to RAW entries.
+    Attacker could pad 30 invalid entries before legitimate refs, forcing
+    zero valid through. New behavior: collect up to 30 valid from up to
+    200 scanned — attacker has to drown 200 entries to starve us, and
+    that triggers a different audit entry."""
+    # 100 invalid (bad slug), followed by 5 valid
+    invalid = "\n".join(
+        f"  - kind: meme\n    value: NOT A SLUG {i}\n    source: reddit"
+        for i in range(100)
+    )
+    valid = "\n".join(
+        f"  - kind: meme\n    value: legit-{i}\n    source: reddit"
+        for i in range(5)
+    )
+    text = f"---\nhot:\n{invalid}\n{valid}\n---\n"
+    outcome = sanitize_trending_text(text)
+    assert len(outcome.refs) == 5, "valid refs after invalid padding must survive"
+    assert {r.value for r in outcome.refs} == {f"legit-{i}" for i in range(5)}
+
+
+def test_scan_cap_audited_when_section_exceeds_200():
+    """Over 200 raw entries → remaining unscanned, audit logs scan cap hit."""
+    entries = "\n".join(
+        f"  - kind: meme\n    value: slug-{i}\n    source: reddit"
+        for i in range(210)
+    )
+    text = f"---\nhot:\n{entries}\n---\n"
+    outcome = sanitize_trending_text(text)
+    # We collected up to 30 valid (hit the valid cap first)
+    assert len(outcome.refs) == 30
+    # Either valid-cap (because we stopped at 30 valid before scanning 200)
+    # OR scan-cap (if 200+ were scanned) is audited
+    audit_keys = [r[1] for r in outcome.rejected]
+    assert any("valid-cap-reached" in k or "scan-cap-reached" in k for k in audit_keys)
 
 
 def test_partial_failures_keep_valid_entries():

@@ -32,12 +32,21 @@ same — `0.0..1.0` score, threshold comparison in `run_eval_suite`.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-# Phase 1 default; tightened when real similarity (embeddings) lands
+# Phase 1 default; tightened when real similarity (embeddings) lands.
+# Word-Jaccard is stricter than character-Jaccard for the same threshold —
+# this 0.4 catches "similar but reordered" as similar, but rejects
+# "same alphabet, completely different words" which character-Jaccard
+# missed (Codex finding 2026-05-18).
 DEFAULT_SIMILARITY_THRESHOLD = 0.4
+
+# Tokenizer for similarity scoring. Splits on whitespace + punctuation
+# boundaries, lowercases, drops empty tokens. Cheap and deterministic.
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
 
 
 @dataclass
@@ -71,22 +80,40 @@ class EvalSuiteResult:
 
 # ---------- Similarity ----------
 
-def character_jaccard(a: str, b: str) -> float:
-    """Character-level Jaccard similarity. Coarse, but deterministic and
-    dependency-free. Returns 0.0..1.0.
+def _tokenize(text: str) -> set[str]:
+    return {tok.lower() for tok in _WORD_RE.findall(text or "")}
+
+
+def word_jaccard(a: str, b: str) -> float:
+    """Word-level Jaccard similarity. Tokenizes on word boundaries,
+    lowercases, returns |intersection| / |union|.
+
+    Replaces the prior character-set Jaccard (Codex finding 2026-05-18:
+    char-set ignored order AND frequency, so "abc def ghi" and "ghi cba fed"
+    scored 1.0). Word-set still ignores order and frequency but the unit
+    of comparison is meaningful — sentences with the same words in any
+    order DO carry the same persona content; the persona-stability check
+    cares about content overlap, not exact phrasing.
 
     Phase 2 replaces this with embedding cosine; the function signature
-    (two strings → float) stays.
+    (two strings → float) stays the same so call sites don't move.
     """
     if not a and not b:
         return 1.0
-    if not a or not b:
+    set_a = _tokenize(a)
+    set_b = _tokenize(b)
+    if not set_a and not set_b:
+        return 1.0
+    if not set_a or not set_b:
         return 0.0
-    set_a = set(a.lower())
-    set_b = set(b.lower())
     inter = len(set_a & set_b)
     union = len(set_a | set_b)
     return inter / union if union > 0 else 0.0
+
+
+# Back-compat alias; existing tests use this name. Delete after Phase 2
+# embedding swap when call sites update.
+character_jaccard = word_jaccard
 
 
 # ---------- Suite loader ----------
@@ -182,7 +209,7 @@ def run_eval_suite(
             continue
 
         structural_failures = _check_structural(generated_text, case.expected)
-        similarity = character_jaccard(generated_text, case.golden_text)
+        similarity = word_jaccard(generated_text, case.golden_text)
         passed = not structural_failures and similarity >= similarity_threshold
         case_results.append(EvalCaseResult(
             case_id=case.id,

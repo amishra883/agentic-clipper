@@ -19,6 +19,7 @@ from agents.db import init_schema
 from agents.stage_lease import (
     Lease,
     LeaseConflict,
+    StaleArtifactVersion,
     stage_lease,
     sweep_expired_leases,
 )
@@ -134,6 +135,39 @@ def test_different_stages_can_run_concurrently(migrated_db):
     with stage_lease("test-clip-1", stage="editor", ttl_seconds=60):
         with stage_lease("test-clip-1", stage="writer", ttl_seconds=60):
             pass  # both held simultaneously, no conflict
+
+
+def test_stale_artifact_version_raises_and_marks_failed(migrated_db):
+    """Codex 2026-05-18 fix: if another stage bumped artifact_version
+    between our lease-start read and our lease-end write, the conditional
+    UPDATE has rowcount=0 and we must raise (was: silently committed
+    succeeded with the stale version pointer).
+
+    Simulate the race: hold a lease, then have another connection bump
+    artifact_version externally. When we try to bump on lease exit,
+    the CAS fails."""
+    with pytest.raises(StaleArtifactVersion, match="moved past"):
+        with stage_lease("test-clip-1", stage="editor", ttl_seconds=60) as lease:
+            # Simulate another stage racing ahead: directly bump artifact_version
+            # to 2 while we hold the editor lease at input_version=1
+            with sqlite3.connect(migrated_db) as conn:
+                conn.execute(
+                    "UPDATE clip_artifacts SET artifact_version = 2 WHERE clip_id = ?",
+                    ("test-clip-1",),
+                )
+                conn.commit()
+            lease.output_artifact_version = 2  # would-be 1→2, but DB is already 2
+
+    # Verify the run row was marked failed (audit trail)
+    with sqlite3.connect(migrated_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status, failure_reason FROM pipeline_runs "
+            "WHERE clip_id = 'test-clip-1' AND stage = 'editor' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["status"] == "failed"
+        assert "stale_artifact_version" in (row["failure_reason"] or "")
 
 
 def test_different_clips_can_run_same_stage_concurrently(migrated_db):

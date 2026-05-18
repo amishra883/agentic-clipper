@@ -110,7 +110,7 @@ def check_system_binaries() -> list[CheckOutcome]:
     return out
 
 
-def check_python_deps(apply: bool = False) -> list[CheckOutcome]:
+def check_python_deps() -> list[CheckOutcome]:
     if not REQUIREMENTS.exists():
         return [CheckOutcome("requirements.txt", False, "missing")]
     # Don't actually call pip --dry-run (slow + network). Just confirm pyyaml
@@ -211,7 +211,7 @@ def main() -> int:
     print("=== agentic-clipper setup ===\n")
     sections: list[tuple[str, list[CheckOutcome]]] = [
         ("System binaries", check_system_binaries()),
-        ("Python deps", check_python_deps(apply=args.apply)),
+        ("Python deps", check_python_deps()),
         ("Database", check_db_state()),
         (".env keys", check_env_keys()),
         ("Avatar reference image", check_avatar()),
@@ -234,11 +234,19 @@ def main() -> int:
     if args.apply:
         print("--- --apply: safe automations ---")
         # Run the small bounded set: pip install missing pyyaml/pytest, init-db, migrate.
+        # Codex finding 2026-05-18: `pip install --user` inside a venv installs
+        # to the user site-packages instead of the venv's site-packages —
+        # the venv stays broken. Detect venv via `sys.prefix != sys.base_prefix`
+        # (the canonical Python idiom) and omit --user when inside one.
+        in_venv = sys.prefix != sys.base_prefix
+        pip_cmd = [sys.executable, "-m", "pip", "install", "--quiet"]
+        if not in_venv:
+            pip_cmd.append("--user")
+        pip_cmd.extend(["pyyaml", "pytest"])
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--user", "--quiet", "pyyaml", "pytest"]
-            )
-            print("[OK]   pip installed pyyaml + pytest")
+            subprocess.check_call(pip_cmd)
+            scope = "(venv)" if in_venv else "(--user)"
+            print(f"[OK]   pip installed pyyaml + pytest {scope}")
         except subprocess.CalledProcessError as exc:
             print(f"[FAIL] pip install: {exc}")
             total_failures += 1
