@@ -1,0 +1,9 @@
+[
+  {
+    "relative_path": "PLACEHOLDER_REPLACE_BEFORE_PHASE_2.wav",
+    "start_s": 0.0,
+    "end_s": 30.0,
+    "has_music": false,
+    "note": "placeholder entry; manifest is empty until operator labels real clips. Harness tests skip the precision/recall floor while count < 50."
+  }
+]

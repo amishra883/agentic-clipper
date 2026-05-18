@@ -1,0 +1,23 @@
+{
+  "id": "000-placeholder",
+  "label": "Placeholder entry — replace before Phase 2 Writer wiring",
+  "_status": "PLACEHOLDER",
+  "_note": "The eval runner counts this as 0 toward the 20-golden requirement. Remove this file once real golden outputs land.",
+  "input": {
+    "creator": "PlaceholderCreator",
+    "source_excerpt": "placeholder transcript",
+    "punch_beats_s": [],
+    "trending_refs": []
+  },
+  "expected": {
+    "substance_tags_min": 0,
+    "trending_refs_used_min": 0,
+    "punch_density_min": 0.0,
+    "must_contain_any": [],
+    "must_not_contain_any": [],
+    "do_not_violations": []
+  },
+  "_golden_output_text": "placeholder",
+  "_locked_at": "2026-05-18",
+  "_persona_version": "placeholder"
+}
