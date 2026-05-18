@@ -11,30 +11,41 @@ This directory holds locked reference images and seed values that keep our AI co
 
 ## Persona → avatar mapping
 
-| Persona ID | Persona name     | Reference image           | Locked seed          | Status   |
-|------------|------------------|---------------------------|----------------------|----------|
-| P-01       | manic_reactor    | `manic_reactor.png` (TBD) | `8376739915435003287`| pending  |
+| Persona ID | Persona name     | Reference image    | Locked seed          | Status |
+|------------|------------------|--------------------|----------------------|--------|
+| P-01       | manic_reactor    | `manic_reactor.png`| `8376739915435003287`| locked |
 
-The seed is locked NOW so the avatar identity is reproducible the moment a Seedance account exists. Do not change this value once a reference image is generated — changing the seed produces a different character.
+The seed is locked so the avatar identity is reproducible. Do not change this value — changing the seed produces a different character.
 
-## Why the reference image is deferred
+## Reference image generation history
 
-Reference image generation is gated on Phase 0.7 finishing (Seedance provider chosen + account funded). Generating it earlier on a different model risks visual drift when we re-generate on Seedance later. See `docs/phase0_digest.md` for the action item.
+Generated 2026-05-17 on Atlas Cloud's `bytedance/seedream-v5.0-lite` image API (Seedance's image sibling — Seedance itself is video-only). Three iterations on prompt; operator accepted the third. The committed `manic_reactor.png` IS the canonical reference. Do not change the seed or the prompt below without a `/proposals/` review per the "Changing the avatar later" section.
+
+**Style decision (operator, 2026-05-17):** the v3 prompt below explicitly says "NOT anime", but Seedream's training bias produced an anime/manhwa-leaning result anyway. Operator accepted the anime-leaning aesthetic as on-trend for short-form virality. The "NOT anime" clause is preserved in the prompt verbatim because it IS what was passed to the model — re-running this exact `(seed, prompt)` pair against Seedream v5.0-lite is the only way to deterministically recover this image, and changing the prompt to match the output would break that guarantee.
 
 ## Reference image prompt (manic_reactor)
 
-When the Seedance account exists, generate a single static reference image with this prompt and the locked seed above. Save as `manic_reactor.png` next to this README, then commit.
+The exact prompt used to produce the committed `manic_reactor.png`. To reproduce, pass this verbatim with the locked seed and parameters below to `bytedance/seedream-v5.0-lite` via Atlas Cloud's `POST /api/v1/model/generateImage`. The canonical runner is `scripts/generate_avatar.py`.
 
 ```
-A stylized cartoon character designed as a podcast/video reactor mascot.
-Friendly but unhinged energy. Big expressive eyes (cartoon-large, not anime),
-wide flexible mouth capable of exaggerated faces. Round-ish head, simple
-shape language, one signature accessory (a chunky pair of headphones around
-the neck). Bright primary palette, thick clean linework, modern flat-shaded
-animation style — think contemporary animated short, not 1990s Saturday
-morning. Front-facing, neutral pose, looking slightly off-camera, expression
-mid-grin. Plain neutral background. NOT a real person, NOT a celebrity, NOT
-based on any specific human likeness. Mascot quality.
+A stylized animated-feature illustration of an original young-adult character
+(early-to-mid 20s, NOT a child, NOT middle-aged) designed as a podcast/video
+reactor mascot for short-form gaming and reaction content. Realistic-leaning
+humanoid proportions — modern animated-feature build (head roughly 1/7 of
+body, NOT chibi, NOT toddler-coded), but still clearly illustrated and
+cartoon-styled, NOT photoreal, NOT 3D render, NOT anime. Spider-Verse / Arcane
+/ Soul-style aesthetic: bold confident linework, modern flat shading with
+subtle gradient lighting, on-trend streaming-mascot look optimized for
+short-form video virality. Default expression is warm and approachable —
+confident, slightly amused. This is the REST state, NOT a peak reaction.
+Expressive eyes (cartoon-proportioned but not oversized), soft neutral or
+slightly-raised eyebrows. Mouth in a relaxed closed-mouth half-smile — NOT a
+wide teeth-bare grin, NOT a grimace. Front-facing torso, eyes drifting
+slightly off-camera in a relaxed gaze. Contemporary casual outfit (modern
+streetwear or graphic tee), bright contemporary palette. ONE signature
+accessory: a chunky pair of headphones around the neck. Plain neutral
+background. NOT a real person, NOT a celebrity, NOT a streamer likeness, NOT
+based on any specific human. Original mascot character.
 ```
 
 Required generation parameters (locked):

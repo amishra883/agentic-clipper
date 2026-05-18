@@ -59,15 +59,25 @@ USER_AGENT = (
 
 # Mirrors the prompt locked in config/avatars/README.md.
 PROMPT = (
-    "A stylized cartoon character designed as a podcast/video reactor mascot. "
-    "Friendly but unhinged energy. Big expressive eyes (cartoon-large, not anime), "
-    "wide flexible mouth capable of exaggerated faces. Round-ish head, simple "
-    "shape language, one signature accessory (a chunky pair of headphones around "
-    "the neck). Bright primary palette, thick clean linework, modern flat-shaded "
-    "animation style — think contemporary animated short, not 1990s Saturday "
-    "morning. Front-facing, neutral pose, looking slightly off-camera, expression "
-    "mid-grin. Plain neutral background. NOT a real person, NOT a celebrity, "
-    "NOT based on any specific human likeness. Mascot quality."
+    "A stylized animated-feature illustration of an original young-adult "
+    "character (early-to-mid 20s, NOT a child, NOT middle-aged) designed as "
+    "a podcast/video reactor mascot for short-form gaming and reaction "
+    "content. Realistic-leaning humanoid proportions — modern animated-feature "
+    "build (head roughly 1/7 of body, NOT chibi, NOT toddler-coded), but still "
+    "clearly illustrated and cartoon-styled, NOT photoreal, NOT 3D render, "
+    "NOT anime. Spider-Verse / Arcane / Soul-style aesthetic: bold confident "
+    "linework, modern flat shading with subtle gradient lighting, on-trend "
+    "streaming-mascot look optimized for short-form video virality. "
+    "Default expression is warm and approachable — confident, slightly amused. "
+    "This is the REST state, NOT a peak reaction. Expressive eyes (cartoon-"
+    "proportioned but not oversized), soft neutral or slightly-raised eyebrows. "
+    "Mouth in a relaxed closed-mouth half-smile — NOT a wide teeth-bare grin, "
+    "NOT a grimace. Front-facing torso, eyes drifting slightly off-camera in "
+    "a relaxed gaze. Contemporary casual outfit (modern streetwear or graphic "
+    "tee), bright contemporary palette. ONE signature accessory: a chunky "
+    "pair of headphones around the neck. Plain neutral background. NOT a real "
+    "person, NOT a celebrity, NOT a streamer likeness, NOT based on any "
+    "specific human. Original mascot character."
 )
 
 # Per-image cost for Seedream v5.0 Lite at the time of writing (2026-05-14).
