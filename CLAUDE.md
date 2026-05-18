@@ -2,7 +2,9 @@
 
 ## Mission
 
-Build an autonomous, agentic clipping operation that produces AI-narrated reaction/commentary short-form videos derived from the highest-aggregate-view creators across Twitch, YouTube, TikTok, Instagram (and Kick, if relevant) **who have open, publicly-documented clipper programs**. Distribute across YouTube Shorts, TikTok, and Instagram Reels. Monetize via platform ad rev share and affiliate links. Exit via account sale once metrics qualify.
+Build an autonomous, agentic clipping operation that produces AI-narrated reaction/commentary short-form videos derived from the highest-aggregate-view creators across Twitch, YouTube, TikTok, Instagram (and Kick, if relevant). Distribute across YouTube Shorts, TikTok, and Instagram Reels. Monetize via platform ad rev share and affiliate links. Exit via account sale once metrics qualify.
+
+**Legal posture (updated 2026-05-14):** This operation is fair-use-defended (see `docs/fair_use_position.md`), not licensed. The original Phase 0 mission gated creator selection on "open, publicly-documented clipper programs" — operator dropped this requirement on 2026-05-14 after finding that program coverage was too thin to be load-bearing. Creator selection is now by view-velocity + content type only. The legal shield is the fair-use defense + the Compliance gate's structural rules (≤30s source, ≥50% commentary, AI-content disclosure), not a creator license. This is a more contested legal posture; the Compliance gate carries the entire defense.
 
 The system runs on a local server, orchestrated by Claude Code, with sub-agents handling scouting, editing, scripting, voicing, composition, compliance, publishing, and learning.
 
@@ -22,8 +24,8 @@ The system runs on a local server, orchestrated by Claude Code, with sub-agents 
 
 - Budget: **≤ $200/month** in external services (Claude Max 20x covers LLM usage from inside Claude Code sessions)
 - Local server orchestration; cloud only for posting endpoints and offsite backup
-- Solo operator; ≤30 min/day attention budget
-- **Zero copyright strikes tolerated** on primary accounts (failover to backups on first claim)
+- Solo operator. Attention budget: **≤45 min/day at steady state, ≤60 min/day during the first 30 days** (revised 2026-05-18 from the original ≤30 min/day; reality-checked against ~90 manual TikTok uploads/mo + weekly Optimizer review + strike monitoring)
+- **Zero copyright STRIKES tolerated** on primary accounts (failover to backups on first claim). Distinct from CLAIMS — Content ID *claims* (revenue redirected) are expected at low rates and not failure events. A *strike* (policy violation) is.
 - AI commentary must be **≥50% of audio runtime** per clip
 - Source footage **≤30s** per clip; total output ≤60s for Shorts/Reels/TikTok
 - Written description on every video discloses transformative commentary purpose and includes affiliate disclosure when applicable
@@ -34,7 +36,9 @@ The system runs on a local server, orchestrated by Claude Code, with sub-agents 
 
 Claude Code must complete and produce artifacts for all of the following, then **stop and present findings for human approval** before scaffolding the pipeline.
 
-### 0.1 Verify open clipper programs
+### 0.1 ~~Verify open clipper programs~~ (HISTORICAL — operator dropped this requirement 2026-05-14)
+
+This Phase 0 step was completed but its output is now historical. Operator's 2026-05-14 decision (`docs/fair_use_position.md:7`) moves the project to fair-use-only posture; clipper programs are no longer required for creator selection. The section is retained below for the audit trail.
 
 Web-search and confirm **currently-active, publicly-documented** clipper agreements. Likely candidates to investigate (verify each — programs open and close frequently):
 
@@ -383,8 +387,8 @@ A monthly cost report runs on the 1st. If projected month-end exceeds $200, the 
 
 - **Month 1**: pipeline produces ≥5 clips/day with zero strikes. At least 1 video crosses 100k views.
 - **Month 3**: one platform monetized (YPP eligibility, TikTok Creativity Program eligibility, or equivalent). Affiliate applications opened.
-- **Month 6**: two platforms monetized. ≥$500/mo ad rev. Net-positive operation.
-- **Month 9–12**: account-sale candidacy. Bundled valuation across YT + TikTok + IG. Target multiple: 6–12x monthly profit on private marketplaces, **assuming the marketplace and platforms still permit transfer** (verify at sale time).
+- **Month 6**: two platforms monetized. ≥$500/mo **blended revenue (ad-rev + affiliate + creator-fund where applicable)**. Net-positive operation. Note: pure Shorts ad-rev at ~$0.04 RPM cannot reach $500/mo at solo-operator scale; the $500 target is realistic only as a blended figure where affiliate revenue carries the majority. Track per-revenue-source breakdown.
+- **Month 9–12**: account-sale candidacy. Bundled valuation across YT + TikTok + IG. Target multiple: **3–6x monthly profit** on private marketplaces (revised 2026-05-18 from the original 6–12x after `docs/exit_strategy.md:7` documented that account transfer violates ToS of all three platforms — realistic multiples sit lower because the buyer pool is narrower and AI-content disclosure shrinks it further). Conditional on: ToS-tolerant buyer, clean strike record, marketplace policy unchanged at sale time.
 
 -----
 
