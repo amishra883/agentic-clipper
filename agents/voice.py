@@ -167,11 +167,96 @@ def verify_coqui_checkpoint(*, checkpoint_path: Path | None = None) -> dict:
 # ---------- TTS engine adapters ----------
 
 
+_coqui_tts = None
+
+
+def _get_coqui_tts():
+    """Lazy-initialize the Coqui TTS object. Returns None if the package
+    isn't installed — caller falls back to NotImplementedError so the
+    voice agent's scaffold path stays open.
+
+    Coqui's `TTS` class loads a multi-hundred-MB model on construction;
+    we cache the instance across calls. The cache is process-local, not
+    thread-safe for construction — fine for our single-process
+    orchestrator."""
+    global _coqui_tts
+    if _coqui_tts is not None:
+        return _coqui_tts
+    try:
+        from TTS.api import TTS
+    except ImportError:
+        return None
+    cfg = _voice_models_config()
+    coqui_cfg = cfg.get("coqui_xtts_v2") or {}
+    model_name = coqui_cfg.get("model_name", "tts_models/multilingual/multi-dataset/xtts_v2")
+    # progress_bar=False keeps the digest readable; gpu=False because
+    # the operator's box is typically CPU-only.
+    _coqui_tts = TTS(model_name=model_name, progress_bar=False, gpu=False)
+    return _coqui_tts
+
+
 async def _synthesize_coqui(text: str, persona: dict, dest_path: Path) -> float:
-    """Local Coqui XTTS-v2 inference. Phase 2 wires the actual model
-    call; Phase 1 raises NotImplementedError and the caller falls
-    through to a placeholder track."""
-    raise NotImplementedError("live mode not implemented in Phase 1 scaffold")
+    """Local Coqui XTTS-v2 inference. Writes a WAV to ``dest_path`` and
+    returns its runtime in seconds.
+
+    The speaker reference WAV is pulled from ``persona['voice']
+    ['coqui_speaker_wav']`` (a fixed sample of the desired voice — the
+    XTTS-v2 model performs zero-shot cloning from a 6-30s reference).
+    No reference WAV → fall back to a neutral built-in speaker.
+
+    Raises ``NotImplementedError`` if Coqui TTS isn't installed so the
+    caller's fallback path (skip-to-placeholder in scaffold mode) still
+    fires. Other failures (model file missing, GPU OOM in non-CPU mode,
+    transient IO) raise ``TransientError`` so ``retry_external`` retries.
+    """
+    tts = _get_coqui_tts()
+    if tts is None:
+        raise NotImplementedError(
+            "Coqui TTS not installed; install with `pip install TTS`"
+        )
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    voice_cfg = (persona or {}).get("voice") or {}
+    speaker_wav = voice_cfg.get("coqui_speaker_wav")
+    speaker = voice_cfg.get("coqui_default_speaker", "Damien Black")
+    language = voice_cfg.get("language", "en")
+
+    import asyncio
+    import wave
+
+    def _do_synthesis() -> None:
+        # XTTS-v2 prefers a `speaker_wav` reference for the manic-reactor
+        # persona; if absent (operator hasn't recorded one yet) fall back
+        # to a built-in speaker so the pipeline still runs.
+        kwargs = {"text": text, "file_path": str(dest_path), "language": language}
+        if speaker_wav and Path(speaker_wav).expanduser().exists():
+            kwargs["speaker_wav"] = str(Path(speaker_wav).expanduser())
+        else:
+            kwargs["speaker"] = speaker
+        tts.tts_to_file(**kwargs)
+
+    try:
+        await asyncio.to_thread(_do_synthesis)
+    except FileNotFoundError as exc:
+        # Reference WAV vanished mid-call — not transient.
+        raise RuntimeError(f"coqui synth: missing reference: {exc}") from exc
+    except OSError as exc:
+        raise TransientError(f"coqui synth IO error: {exc}") from exc
+
+    if not dest_path.exists() or dest_path.stat().st_size == 0:
+        raise TransientError(f"coqui synth produced empty file at {dest_path}")
+
+    # Read the WAV header to get the actual runtime. ffprobe would also
+    # work but stdlib `wave` avoids a subprocess hop for the success path.
+    try:
+        with wave.open(str(dest_path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            runtime_s = frames / float(rate) if rate else 0.0
+    except wave.Error:
+        # File exists but isn't WAV-readable — caller will catch in the
+        # validate step. Return 0 so downstream doesn't trust the value.
+        runtime_s = 0.0
+    return runtime_s
 
 
 @retry_external(max_attempts=3, base_delay_s=2.0)

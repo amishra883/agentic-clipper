@@ -455,6 +455,54 @@ def check_account_warming() -> list[CheckResult]:
     return out
 
 
+def check_pipeline_dependencies() -> list[CheckResult]:
+    """Verify the local tools the orchestrator needs are on PATH /
+    importable. Each missing piece downgrades the relevant stage to
+    scaffold mode rather than blocking — but the operator should see
+    what's missing in one place.
+
+    PATH binaries:
+      - ffmpeg, ffprobe (Compositor)
+      - yt-dlp (Editor download)
+
+    Python packages:
+      - faster_whisper (Editor transcribe)
+      - TTS (Coqui XTTS-v2; Voice)
+    """
+    import shutil
+    import importlib.util
+
+    out: list[CheckResult] = []
+    for binary in ("ffmpeg", "ffprobe", "yt-dlp"):
+        path = shutil.which(binary)
+        if path:
+            out.append(CheckResult(
+                name=f"binary: {binary}", ok=True, detail=path,
+            ))
+        else:
+            out.append(CheckResult(
+                name=f"binary: {binary}", ok=False,
+                detail=(
+                    "not on PATH; install (`brew install ffmpeg`, "
+                    "`pip install yt-dlp`). Stage falls back to "
+                    "scaffold mode until installed."
+                ),
+            ))
+
+    for pkg, hint in (
+        ("faster_whisper", "pip install faster-whisper"),
+        ("TTS", "pip install TTS  # Coqui XTTS-v2 — installs ~2GB of models on first run"),
+    ):
+        if importlib.util.find_spec(pkg) is not None:
+            out.append(CheckResult(name=f"python: {pkg}", ok=True, detail="importable"))
+        else:
+            out.append(CheckResult(
+                name=f"python: {pkg}", ok=False,
+                detail=f"not installed; {hint}. Stage falls back to scaffold mode.",
+            ))
+    return out
+
+
 CHECKS = [
     check_configs_parse,
     check_schema,
@@ -468,6 +516,7 @@ CHECKS = [
     check_monthly_budget_burn,
     check_strike_monitor,
     check_account_warming,
+    check_pipeline_dependencies,
     check_live_apis,
 ]
 

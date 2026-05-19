@@ -57,7 +57,7 @@ from agents.db import connect
 from agents.events import log
 from agents.models import TranscriptSegment
 from agents.music_detector import detect_music_in_segment, DetectorMethod
-from agents.retry import RetryGiveUp, retry_external
+from agents.retry import RetryGiveUp, TransientError, retry_external
 from agents.stage_lease import LeaseConflict, stage_lease
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -100,17 +100,88 @@ def _yt_dlp_player_client() -> str:
     return os.environ.get("EDITOR_YT_DLP_PLAYER_CLIENT", "tv_simply")
 
 
+# Errors yt-dlp prints to stderr that map cleanly to transient failures.
+# Lowercased substring match — yt-dlp's exact phrasing has drifted across
+# versions, so we look for substrings, not full-line matches.
+_YT_DLP_TRANSIENT_MARKERS = (
+    "http error 5",            # 5xx upstream
+    "http error 429",          # rate limit
+    "read timed out",
+    "connection reset",
+    "connection timed out",
+    "temporary failure",
+    "network is unreachable",
+)
+
+
 @retry_external(max_attempts=3, base_delay_s=2.0)
 async def _download_source(source_url: str, dest_path: Path) -> None:
-    """Run yt-dlp to fetch the source clip.
+    """Run yt-dlp to fetch the source clip into ``dest_path``.
 
-    Phase 2 wires: yt-dlp invoked via subprocess with the player_client
-    from env, mp4+aac format filter, max-duration cap, proxy from
-    `config/proxy_pool.yaml`. Transient errors (network 5xx, proxy
-    rotation) raise TransientError so retry_external retries; permanent
-    errors (age-gate, geo-block, content removed) raise to caller.
+    Invokes ``yt-dlp`` as a subprocess with:
+      - mp4-only format filter so Compositor doesn't have to remux
+      - `--player-client` from env (defaults to `tv_simply`; bypasses
+        YouTube's PoToken requirement for the time being)
+      - `--no-playlist` so a single video URL doesn't spider a channel
+      - `--no-warnings` to keep stderr signal-to-noise high
+      - `--socket-timeout 30` so a hung TCP connection doesn't pin the
+        retry loop forever
+
+    Transient failures (5xx, 429, network resets) raise ``TransientError``
+    so the ``retry_external`` wrapper retries with backoff. Anything else
+    (age-gate, geo-block, content removed, malformed URL) raises a generic
+    RuntimeError so the caller quarantines without burning retries.
     """
-    raise NotImplementedError("live mode not implemented in Phase 1 scaffold")
+    yt_dlp = shutil.which("yt-dlp")
+    if yt_dlp is None:
+        # Tool absent — orchestrator falls back to scaffold mode the same
+        # way it does when a Python dependency is missing. The operator
+        # installs `pip install yt-dlp` (or `brew install yt-dlp`) and
+        # next run picks up the live path.
+        raise NotImplementedError(
+            "yt-dlp not on PATH; install with `pip install yt-dlp` "
+            "or `brew install yt-dlp`"
+        )
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    # yt-dlp writes the output template; we coerce it to dest_path exactly
+    # via `-o` so atomic rename later is straightforward. The `--no-mtime`
+    # avoids preserving the source's mtime, which would confuse downstream
+    # cache-invalidation heuristics.
+    cmd = [
+        yt_dlp,
+        "--no-playlist",
+        "--no-warnings",
+        "--no-mtime",
+        "--socket-timeout", "30",
+        "--retries", "1",         # retry_external handles the outer loop
+        "--format", "best[ext=mp4]/best",
+        "--extractor-args", f"youtube:player_client={_yt_dlp_player_client()}",
+        "-o", str(dest_path),
+        source_url,
+    ]
+    try:
+        # Run synchronously in a worker thread so the async caller doesn't
+        # block the event loop. Downloads can take 5-60s for short clips,
+        # which would otherwise starve every other coroutine.
+        import asyncio
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd,
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransientError(f"yt-dlp timed out after 300s on {source_url}") from exc
+    if proc.returncode == 0 and dest_path.exists() and dest_path.stat().st_size > 0:
+        return
+    stderr_lower = (proc.stderr or "").lower()
+    if any(marker in stderr_lower for marker in _YT_DLP_TRANSIENT_MARKERS):
+        raise TransientError(
+            f"yt-dlp transient failure (rc={proc.returncode}): "
+            f"{proc.stderr.strip()[:200]}"
+        )
+    # Permanent failure — quarantine, don't retry.
+    raise RuntimeError(
+        f"yt-dlp failed (rc={proc.returncode}): {proc.stderr.strip()[:300]}"
+    )
 
 
 def _ffprobe_inspect(local_path: Path) -> dict[str, Any]:
@@ -203,12 +274,93 @@ def _validate_downloaded_clip(
     return actual_duration
 
 
+# Whisper model identifier. `base.en` is the sweet spot for English-only
+# short clips: ~140MB, runs on CPU in real-time on modern hardware, no GPU
+# required. Operator can override via env if they want larger/multilingual.
+_FASTER_WHISPER_MODEL = os.environ.get("EDITOR_WHISPER_MODEL", "base.en")
+_FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("EDITOR_WHISPER_COMPUTE_TYPE", "int8")
+
+# Cache the model across calls so we don't reload the ~140MB weights every
+# time. faster-whisper's WhisperModel is thread-safe for inference but
+# not for construction; we serialize the initial load via the module
+# import barrier.
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Lazy-initialize and cache the faster-whisper model. Returns None if
+    the package isn't installed — caller falls back to NotImplementedError
+    so the orchestrator can run in scaffold mode."""
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return None
+    _whisper_model = WhisperModel(
+        _FASTER_WHISPER_MODEL,
+        device="cpu",
+        compute_type=_FASTER_WHISPER_COMPUTE_TYPE,
+    )
+    return _whisper_model
+
+
 @retry_external(max_attempts=2, base_delay_s=1.0)
 async def _transcribe(local_path: Path) -> list[TranscriptSegment]:
-    """Run faster-whisper on the local clip. Phase 2 wires the actual
-    invocation; transient errors (GPU OOM, model loading races) raise
-    TransientError so retry_external retries."""
-    raise NotImplementedError("live mode not implemented in Phase 1 scaffold")
+    """Run faster-whisper on the local clip and return per-segment
+    transcripts with word-level timestamps.
+
+    Word-level alignment is what powers the burned-in captions and the
+    punch-beat sync for avatar reactions, so we always pass
+    ``word_timestamps=True``.
+
+    Transient failures (model file IO race, OOM, intermittent CUDA
+    errors) raise ``TransientError``; ``NotImplementedError`` signals the
+    package isn't installed and the caller drops to scaffold mode."""
+    model = _get_whisper_model()
+    if model is None:
+        raise NotImplementedError(
+            "faster-whisper not installed; "
+            "install with `pip install faster-whisper`"
+        )
+    import asyncio
+    try:
+        # transcribe() returns (segments_generator, info). The generator
+        # is lazy — we materialize in a thread so the async caller can
+        # yield to other coroutines while CPU-bound decoding runs.
+        def _do_transcribe():
+            segments, _info = model.transcribe(
+                str(local_path),
+                word_timestamps=True,
+                vad_filter=True,             # silence-trim
+                # no_speech_threshold is what populates seg.no_speech_prob;
+                # leaving the default (0.6) is fine, we read the prob
+                # explicitly downstream against our own NO_SPEECH_THRESHOLD.
+            )
+            return list(segments)
+        raw_segments = await asyncio.to_thread(_do_transcribe)
+    except FileNotFoundError as exc:
+        # The audio file vanished mid-transcribe; not transient.
+        raise RuntimeError(f"transcribe: input gone: {local_path}") from exc
+    except OSError as exc:
+        # Disk pressure, intermittent IO — worth retrying.
+        raise TransientError(f"whisper IO error: {exc}") from exc
+
+    out: list[TranscriptSegment] = []
+    for seg in raw_segments:
+        words = [
+            {"start_s": float(w.start), "end_s": float(w.end), "text": w.word}
+            for w in (seg.words or [])
+        ]
+        out.append(TranscriptSegment(
+            start_s=float(seg.start),
+            end_s=float(seg.end),
+            text=seg.text.strip(),
+            words=words,
+            no_speech_prob=float(getattr(seg, "no_speech_prob", 0.0) or 0.0),
+        ))
+    return out
 
 
 def _is_all_no_speech(transcript: list[TranscriptSegment]) -> bool:

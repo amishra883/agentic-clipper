@@ -177,6 +177,44 @@ The pipeline produces ~3 TikTok-targeted clips/day per `config/posting_schedule.
 
 ---
 
+## 7.4 Local tool dependencies
+
+The pipeline uses three external binaries and two Python packages, all
+free and open-source. Each stage degrades gracefully (falls back to
+scaffold mode) when its tool isn't installed, but `make doctor` will
+surface every missing one.
+
+Install once on your operator machine:
+
+```bash
+# macOS — Homebrew bundles ffmpeg + ffprobe
+brew install ffmpeg
+
+# Python packages (use the same Python that runs the pipeline)
+pip install yt-dlp faster-whisper TTS
+```
+
+What each tool does:
+
+| Tool | Stage | Phase 1 fallback if missing |
+|------|-------|------------------------------|
+| `ffmpeg` / `ffprobe` | Compositor (video composition, LUFS measurement) + Editor (download validation) | scaffold mode — final video is a placeholder, fails Compliance on duration check |
+| `yt-dlp` | Editor (source clip download) | scaffold mode — no source file, downstream stages run with empty input |
+| `faster-whisper` | Editor (transcription, word-level timestamps) | scaffold mode — empty transcript, no-speech gate auto-fails the clip |
+| `TTS` (Coqui XTTS-v2) | Voice (TTS synthesis) | scaffold mode — placeholder audio track |
+
+Verify the install:
+
+```bash
+make doctor
+```
+
+You're looking for `[OK]` next to every `binary:` and `python:` line in
+the `check_pipeline_dependencies` section. Anything that's `[FAIL]`
+will degrade the corresponding stage to scaffold mode.
+
+---
+
 ## 7.5 Running the pipeline end-to-end
 
 `make process N=5` picks up to N candidates in `'curated'` status and runs them through Editor → Writer → Voice → Visuals → Compositor → Compliance → enqueue. Each clip that passes Compliance gets one `clips_ready` row per platform configured in `config/posting_schedule.yaml` (Instagram Reels, YouTube Shorts, TikTok), scheduled for the next available time slot in `America/New_York`.
