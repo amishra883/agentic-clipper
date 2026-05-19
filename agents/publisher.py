@@ -35,6 +35,7 @@ from pathlib import Path
 from agents.config import load
 from agents.db import connect
 from agents.events import log
+from agents.quota import QuotaExceeded, check_quota_or_block, record_attempt
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -323,6 +324,28 @@ async def run_publisher() -> None:
                 rationale=f"no dispatch for target platform '{platform}'")
             continue
 
+        # ---------- Per-day quota gate (Day 13 hardening) ----------
+        # YouTube Data API: 10k units/day (~6 videos.insert). TikTok pre-audit:
+        # 6 posts/24h. IG Graph: 25 posts/24h. Check BEFORE the upload call
+        # so a quota-exceeded post stays 'queued' for tomorrow's run rather
+        # than failing and consuming nothing.
+        try:
+            check_quota_or_block(
+                platform, clip["account_id"], clip_id=clip_id,
+            )
+        except QuotaExceeded:
+            # Don't mark_failed — that'd remove the clip from the queue.
+            # Leaving status='queued' means the next publisher cycle (or
+            # tomorrow's run after the rolling 24h window opens) picks
+            # it up again.
+            continue
+
+        # Record the attempt BEFORE the upload call. A crash mid-upload
+        # still consumed quota platform-side; the local ledger must
+        # reflect that or we'll over-publish.
+        record_attempt(platform, clip["account_id"],
+                       clip_id=clip_id, status="attempted")
+
         try:
             platform_post_id = await dispatch(
                 video_path=artifact.get("final_video_path") or "",
@@ -332,18 +355,25 @@ async def run_publisher() -> None:
                 account_id=clip["account_id"],
             )
         except NotImplementedError:
+            record_attempt(platform, clip["account_id"],
+                           clip_id=clip_id, status="failed")
             _mark_failed(clip["id"], "phase1_scaffold:live_upload_not_wired")
             log(agent="publisher", event_type="phase1_scaffold",
                 clip_id=clip_id, payload={"platform": platform},
                 rationale="upload call stubbed in Phase 1; row marked failed for retry")
             continue
         except Exception as exc:  # pragma: no cover — defensive only
+            record_attempt(platform, clip["account_id"],
+                           clip_id=clip_id, status="failed")
             _mark_failed(clip["id"], f"upload_error:{exc!r}")
             log(agent="publisher", event_type="post_failed", level="error",
                 clip_id=clip_id, payload={"platform": platform, "error": repr(exc)},
                 rationale="upload raised")
             continue
 
+        record_attempt(platform, clip["account_id"],
+                       clip_id=clip_id, status="succeeded",
+                       platform_post_id=platform_post_id)
         _mark_posted(clip["id"], platform_post_id)
         log(agent="publisher", event_type="post_published",
             clip_id=clip_id,
