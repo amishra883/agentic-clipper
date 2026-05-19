@@ -42,7 +42,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterator, Literal
+from typing import Callable, Iterator, Literal
 
 from agents.db import connect
 
@@ -77,12 +77,86 @@ class StaleArtifactVersion(Exception):
 @dataclass
 class Lease:
     """Live lease handle. Caller mutates `output_artifact_version` before
-    the context manager exits; the exit handler persists it."""
+    the context manager exits; the exit handler persists it.
+
+    `commit_artifact()` is the atomic-persist path (Codex 2026-05-18 P1
+    fix). It writes the artifact data AND bumps artifact_version in one
+    BEGIN IMMEDIATE so a concurrent stage can't race past us between
+    our data commit and the lease's version-bump CAS. Stages that use
+    commit_artifact set `_artifact_committed=True`, which makes the
+    lease's end-of-block `_mark_done` skip its legacy CAS (the bump
+    already happened atomically). Stages that don't write artifacts
+    (e.g. Curator, which mutates clips_candidate) use the legacy path
+    via `output_artifact_version=None` and `_mark_done` is a no-op
+    for the clip_artifacts row."""
     run_id: int
     clip_id: str
-    stage: Stage
+    stage: "Stage"
     input_artifact_version: int
     output_artifact_version: int | None = None
+    _artifact_committed: bool = False
+
+    def commit_artifact(
+        self,
+        persist_fn: "Callable[[sqlite3.Connection, int], None]",
+    ) -> None:
+        """Atomic version-checked persist. Replaces the broken pattern of
+        a separate persist transaction followed by a separate lease CAS.
+
+        `persist_fn(conn, new_artifact_version)` is called inside a single
+        BEGIN IMMEDIATE that:
+          1. Re-reads `clip_artifacts.artifact_version` for this clip.
+          2. Raises `StaleArtifactVersion` if it diverged from
+             `self.input_artifact_version` (another stage raced past us).
+          3. Calls persist_fn with the connection and the bumped version
+             so the caller's INSERT/UPDATE writes the new data AND the
+             new `artifact_version=input+1` in one statement.
+          4. Commits atomically. On any exception, rolls back so no
+             partial data lands.
+
+        After successful commit, this method updates `output_artifact_version`
+        on the lease and sets `_artifact_committed=True` so the
+        context manager's exit handler skips the now-redundant CAS in
+        `_mark_done`.
+
+        Stages that previously did `with connect() as conn: conn.execute(
+        'INSERT INTO clip_artifacts ...')` now wrap that body in a
+        callable and pass it here.
+        """
+        # Local import to avoid a circular import between stage_lease and db.
+        from agents.db import connect
+
+        new_version = self.input_artifact_version + 1
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT artifact_version FROM clip_artifacts WHERE clip_id = ?",
+                    (self.clip_id,),
+                ).fetchone()
+                current = int(row["artifact_version"]) if row else 0
+                if current != self.input_artifact_version:
+                    conn.execute("ROLLBACK")
+                    raise StaleArtifactVersion(
+                        f"commit_artifact: clip_id={self.clip_id} "
+                        f"stage={self.stage} expected artifact_version="
+                        f"{self.input_artifact_version} but DB has {current}. "
+                        f"Another stage raced past; output discarded "
+                        f"before any data was written."
+                    )
+                persist_fn(conn, new_version)
+                conn.execute("COMMIT")
+            except StaleArtifactVersion:
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+
+        self.output_artifact_version = new_version
+        self._artifact_committed = True
 
 
 def _claimant_id() -> str:
@@ -189,11 +263,16 @@ def stage_lease(
         raise
 
     # Successful exit. Persist output_artifact_version if the caller set it.
+    # If the caller used `lease.commit_artifact()`, the artifact_version
+    # was already bumped atomically with the data write — _mark_done
+    # must NOT run its legacy CAS in that case (it would find
+    # artifact_version=output instead of input and raise spuriously).
     _mark_done(
         run_id,
         status="succeeded",
         output_version=lease.output_artifact_version,
         failure_reason=None,
+        skip_artifact_cas=lease._artifact_committed,
     )
 
 
@@ -203,11 +282,18 @@ def _mark_done(
     status: Literal["succeeded", "failed"],
     output_version: int | None,
     failure_reason: str | None,
+    skip_artifact_cas: bool = False,
 ) -> None:
     """Flip status to succeeded/failed AND, on success, bump
     clip_artifacts.artifact_version if the caller specified an output
     version. Both writes happen in one BEGIN IMMEDIATE transaction so
-    the lease completion and the artifact bump are atomic."""
+    the lease completion and the artifact bump are atomic.
+
+    `skip_artifact_cas=True` means the caller used `lease.commit_artifact()`,
+    which already bumped artifact_version atomically with the data write.
+    The legacy CAS here would find the row at output_version (not
+    output_version - 1) and raise StaleArtifactVersion spuriously.
+    Skip it; only update pipeline_runs."""
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -232,7 +318,11 @@ def _mark_done(
                 conn.execute("ROLLBACK")
                 return
 
-            if status == "succeeded" and output_version is not None:
+            if (
+                status == "succeeded"
+                and output_version is not None
+                and not skip_artifact_cas
+            ):
                 # Get the clip_id from the run row so we know which
                 # clip_artifacts row to bump.
                 row = conn.execute(

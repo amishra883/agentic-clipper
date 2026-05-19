@@ -452,14 +452,17 @@ async def _run_writer_loop(
 # ---------- Persistence ----------
 
 
-def _persist_script(
-    clip_id: str,
-    script: Script,
-    *,
-    input_artifact_version: int,
-) -> None:
-    """Insert / update clip_artifacts at artifact_version=input so the
-    stage_lease end-of-lease CAS bumps to input+1."""
+def _persist_script(lease, script: Script) -> None:
+    """Atomic persist via `lease.commit_artifact()` — version-check +
+    data write + version bump in one BEGIN IMMEDIATE. If another stage
+    raced past us, StaleArtifactVersion fires BEFORE any data lands
+    (Codex 2026-05-18 P1#1 fix).
+
+    Writer re-running on a clip whose downstream stages already wrote
+    (voice_audio_path, final_video_path) MUST invalidate those columns:
+    a new script makes the old voice synthesis and final video stale
+    (Codex 2026-05-18 P1#2 fix)."""
+    clip_id = lease.clip_id
     shot_list_payload = [
         {
             "shot_type": s.shot_type,
@@ -471,25 +474,42 @@ def _persist_script(
         }
         for s in script.shot_list
     ]
-    with connect() as conn:
+
+    def _do_persist(conn, new_version):
         conn.execute(
             """
             INSERT INTO clip_artifacts
-              (clip_id, script_text, shot_list_json, artifact_version, updated_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
+              (clip_id, script_text, shot_list_json, artifact_version, updated_at,
+               voice_audio_path, voice_runtime_s,
+               visuals_seconds_used, visuals_tier, visuals_cost_usd,
+               final_video_path, final_duration_s)
+            VALUES (?, ?, ?, ?, datetime('now'),
+                    NULL, NULL, 0, NULL, 0, NULL, NULL)
             ON CONFLICT(clip_id) DO UPDATE SET
               script_text = excluded.script_text,
               shot_list_json = excluded.shot_list_json,
               artifact_version = excluded.artifact_version,
-              updated_at = datetime('now')
+              updated_at = datetime('now'),
+              -- Downstream invalidation: any prior Voice/Visuals/Compositor
+              -- output was generated from a previous script; a re-write
+              -- makes it stale, so clear it here.
+              voice_audio_path = NULL,
+              voice_runtime_s = NULL,
+              visuals_seconds_used = 0,
+              visuals_tier = NULL,
+              visuals_cost_usd = 0,
+              final_video_path = NULL,
+              final_duration_s = NULL
             """,
             (
                 clip_id,
                 script.text,
                 json.dumps(shot_list_payload),
-                input_artifact_version,
+                new_version,
             ),
         )
+
+    lease.commit_artifact(_do_persist)
 
 
 # ---------- LLM eval gate ----------
@@ -692,11 +712,11 @@ async def run_writer(clip_id: str) -> Script:
                     rationale="; ".join(violations),
                 )
 
-            _persist_script(
-                clip_id, script,
-                input_artifact_version=lease.input_artifact_version,
-            )
-            lease.output_artifact_version = lease.input_artifact_version + 1
+            # Atomic version-check + data write + version bump via
+            # lease.commit_artifact (sets lease.output_artifact_version
+            # + _artifact_committed so the exit handler skips the
+            # redundant legacy CAS).
+            _persist_script(lease, script)
 
             log(
                 agent="writer",

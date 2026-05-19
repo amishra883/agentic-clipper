@@ -496,6 +496,69 @@ def test_writer_lease_conflict_logs_info_and_reraises(writer_db, monkeypatch):
             asyncio.run(writer.run_writer("2026-05-17-1200-writer"))
 
 
+def test_writer_persist_clears_voice_and_compositor_fields(
+    writer_db, tmp_quarantine, monkeypatch,
+):
+    """Codex 2026-05-18 P1#2: Writer re-running on a clip whose
+    Voice/Compositor stages already produced output MUST clear those
+    columns. A new script makes the old voice + final video stale."""
+    # Seed downstream Voice + Compositor output
+    with sqlite3.connect(writer_db) as conn:
+        conn.execute(
+            """
+            UPDATE clip_artifacts SET
+              voice_audio_path = 'old_voice.wav',
+              voice_runtime_s = 25.0,
+              final_video_path = 'old_final.mp4',
+              final_duration_s = 50.0
+            WHERE clip_id = ?
+            """,
+            ("2026-05-17-1200-writer",),
+        )
+        # If no row exists yet, insert one — clip_artifacts may be empty
+        if conn.total_changes == 0:
+            conn.execute(
+                """
+                INSERT INTO clip_artifacts
+                  (clip_id, voice_audio_path, voice_runtime_s,
+                   final_video_path, final_duration_s, artifact_version)
+                VALUES (?, 'old_voice.wav', 25.0, 'old_final.mp4', 50.0, 0)
+                """,
+                ("2026-05-17-1200-writer",),
+            )
+        conn.commit()
+
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {
+        "per_call_caps": {
+            "anthropic_tokens_per_clip_max": 8000,
+            "rewrite_loop_max_iterations": 3,
+            "anthropic_daily_usd_max": 3.0,
+        },
+        "line_items": {"anthropic_api_buffer": {"monthly_budget_usd": 40}},
+    })
+    monkeypatch.setattr(writer, "stale_check", lambda: False)
+    monkeypatch.setattr(writer, "_load_trending", lambda: "")
+    monkeypatch.setattr(writer, "_placeholder_script", lambda persona: _good_script())
+
+    asyncio.run(writer.run_writer("2026-05-17-1200-writer"))
+
+    with sqlite3.connect(writer_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM clip_artifacts WHERE clip_id = ?",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()
+    # Writer's own columns populated
+    assert row["script_text"] is not None
+    assert row["shot_list_json"] is not None
+    # Downstream invalidated
+    assert row["voice_audio_path"] is None
+    assert row["voice_runtime_s"] is None
+    assert row["final_video_path"] is None
+    assert row["final_duration_s"] is None
+
+
 def test_writer_budget_exceeded_does_not_quarantine(
     writer_db, tmp_quarantine, monkeypatch,
 ):

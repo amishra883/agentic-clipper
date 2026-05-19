@@ -445,3 +445,46 @@ def test_realtime_ratio_floor_is_documented():
     """Doctor surface flags when ratio > this floor."""
     assert voice.COQUI_REALTIME_RATIO_FLOOR >= 1.0
     assert voice.COQUI_REALTIME_RATIO_FLOOR <= 3.0
+
+
+# ---------- Codex 2026-05-18 P1#2: Voice rerun invalidates Compositor ----------
+
+
+def test_voice_persist_clears_compositor_fields(
+    voice_db, tmp_voice_dirs, monkeypatch,
+):
+    """Codex P1#2: re-running Voice on a clip whose Compositor already
+    rendered a final video MUST clear final_video_path. The old final
+    video was rendered against the prior voice track and is stale once
+    we re-synthesize."""
+    # Pre-seed clip_artifacts with Compositor output (and Editor + Writer)
+    with sqlite3.connect(voice_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO clip_artifacts
+              (clip_id, source_local_path, script_text, voice_audio_path,
+               final_video_path, final_duration_s, artifact_version, updated_at)
+            VALUES (?, 'src.mp4', 'a script', 'old_voice.wav',
+                    'old_final.mp4', 50.0, 0, datetime('now'))
+            """,
+            ("voice-clip-1",),
+        )
+        conn.commit()
+
+    _patch_persona_and_caps(monkeypatch)
+    asyncio.run(voice.run_voice("voice-clip-1", _make_script()))
+
+    with sqlite3.connect(voice_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM clip_artifacts WHERE clip_id = ?",
+            ("voice-clip-1",),
+        ).fetchone()
+    # Voice's own columns repopulated
+    assert row["voice_audio_path"] is not None
+    # Compositor downstream invalidated
+    assert row["final_video_path"] is None
+    assert row["final_duration_s"] is None
+    # Upstream stages (Editor, Writer) untouched
+    assert row["source_local_path"] == "src.mp4"
+    assert row["script_text"] == "a script"

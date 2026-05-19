@@ -506,3 +506,55 @@ def test_raw_and_quarantine_dirs_distinct():
     """Don't accidentally point both at the same path — that'd let
     a quarantined clip get re-picked up by the next Editor run."""
     assert RAW_CLIP_DIR.resolve() != QUARANTINE_CLIP_DIR.resolve()
+
+
+# ---------- Codex 2026-05-18 P1#2: Editor rerun invalidates downstream ----------
+
+
+def test_editor_persist_clears_downstream_fields(editor_db, monkeypatch, tmp_path):
+    """Pre-seed clip_artifacts with downstream fields (as if Writer +
+    Voice already ran). When Editor runs, the upsert MUST clear
+    script_text / voice_audio_path / final_video_path so we don't
+    ship a stale combination (Codex P1#2)."""
+    _seed_candidate(editor_db)
+
+    # Seed the row with downstream Writer + Voice + Compositor output
+    with sqlite3.connect(editor_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO clip_artifacts
+              (clip_id, source_local_path, script_text, shot_list_json,
+               voice_audio_path, voice_runtime_s,
+               final_video_path, final_duration_s,
+               artifact_version, updated_at)
+            VALUES (?, 'old.mp4', 'OLD SCRIPT', '[]',
+                    'old_voice.wav', 25.0,
+                    'old_final.mp4', 50.0, 0, datetime('now'))
+            """,
+            ("twitch-edit-0001",),
+        )
+        conn.commit()
+
+    monkeypatch.setattr("agents.editor.RAW_CLIP_DIR", tmp_path / "raw")
+    monkeypatch.setattr("agents.editor.QUARANTINE_CLIP_DIR", tmp_path / "quarantine")
+
+    # Run Editor in scaffold mode (no real download/transcribe)
+    asyncio.run(run_editor("twitch-edit-0001"))
+
+    with sqlite3.connect(editor_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM clip_artifacts WHERE clip_id = ?",
+            ("twitch-edit-0001",),
+        ).fetchone()
+    # Editor's own columns are populated (placeholder values from scaffold)
+    assert row["source_local_path"] is not None
+    # Downstream columns are invalidated
+    assert row["script_text"] is None
+    assert row["shot_list_json"] is None
+    assert row["voice_audio_path"] is None
+    assert row["voice_runtime_s"] is None
+    assert row["final_video_path"] is None
+    assert row["final_duration_s"] is None
+    # And artifact_version bumped (0 → 1)
+    assert row["artifact_version"] == 1

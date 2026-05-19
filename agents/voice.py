@@ -304,29 +304,39 @@ def _reserve_elevenlabs(
 # ---------- Persistence ----------
 
 
-def _persist_audio(
-    clip_id: str,
-    track: AudioTrack,
-    *,
-    input_artifact_version: int,
-) -> None:
-    """Write voice_audio_path + voice_runtime_s under the lease's
-    input artifact version so the end-of-lease CAS bumps cleanly."""
-    with connect() as conn:
+def _persist_audio(lease, track: AudioTrack) -> None:
+    """Atomic persist via `lease.commit_artifact()`. Version-check + data
+    write + version bump happen in one BEGIN IMMEDIATE so a concurrent
+    stage can't race past us between data-commit and version-bump
+    (Codex 2026-05-18 P1#1 fix).
+
+    Voice re-running on a clip whose Compositor already produced a final
+    video MUST invalidate that output: the final video was rendered
+    against the prior voice track and is stale once we resynthesize."""
+    clip_id = lease.clip_id
+
+    def _do_persist(conn, new_version):
         conn.execute(
             """
             INSERT INTO clip_artifacts
               (clip_id, voice_audio_path, voice_runtime_s,
-               artifact_version, updated_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
+               artifact_version, updated_at,
+               final_video_path, final_duration_s)
+            VALUES (?, ?, ?, ?, datetime('now'), NULL, NULL)
             ON CONFLICT(clip_id) DO UPDATE SET
               voice_audio_path = excluded.voice_audio_path,
               voice_runtime_s  = excluded.voice_runtime_s,
               artifact_version = excluded.artifact_version,
-              updated_at       = datetime('now')
+              updated_at       = datetime('now'),
+              -- Downstream invalidation: a Compositor final video built
+              -- against the prior voice track is stale once we re-synth.
+              final_video_path = NULL,
+              final_duration_s = NULL
             """,
-            (clip_id, track.path, track.runtime_s, input_artifact_version),
+            (clip_id, track.path, track.runtime_s, new_version),
         )
+
+    lease.commit_artifact(_do_persist)
 
 
 # ---------- Benchmark (E-27) ----------
@@ -567,11 +577,11 @@ async def run_voice(clip_id: str, script: Script) -> AudioTrack:
                 engine=actual_engine,
                 voice_id=_pick_voice_id(persona, actual_engine),
             )
-            _persist_audio(
-                clip_id, track,
-                input_artifact_version=lease.input_artifact_version,
-            )
-            lease.output_artifact_version = lease.input_artifact_version + 1
+            # Atomic version-check + data write + version bump via
+            # lease.commit_artifact (sets lease.output_artifact_version
+            # + _artifact_committed so the exit handler skips the
+            # redundant legacy CAS).
+            _persist_audio(lease, track)
 
             log(
                 agent="voice",

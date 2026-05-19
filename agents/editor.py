@@ -303,22 +303,28 @@ def _load_candidate(clip_id: str) -> dict:
 
 
 def _persist_artifact(
-    clip_id: str,
+    lease,
     *,
     source_local_path: str,
     transcript: list[TranscriptSegment],
     start_s: float,
     end_s: float,
     has_music: int | None,
-    input_artifact_version: int,
 ) -> None:
-    """Insert (or update) the clip_artifacts row. The row is written with
-    artifact_version=input_artifact_version so that stage_lease's
-    end-of-lease CAS update (`artifact_version = input + 1 WHERE
-    artifact_version = input`) succeeds. If a different stage raced past
-    us, stage_lease will raise StaleArtifactVersion and the run is
-    discarded — exactly the protection E-1 added.
+    """Atomic persist via `lease.commit_artifact()`. The data write AND
+    the artifact_version bump happen in one BEGIN IMMEDIATE so a
+    concurrent stage cannot race past us between data-commit and
+    version-bump. Raises StaleArtifactVersion if another stage already
+    moved past our input_artifact_version — and crucially, no partial
+    data lands when that happens (Codex 2026-05-18 P1#1 fix).
+
+    Editor re-running on a clip that already has downstream artifacts
+    (script_text, voice_audio_path, etc.) MUST invalidate those columns:
+    a fresh transcript / punch segment makes the prior script and voice
+    stale, and shipping that combination would publish a script written
+    for a different edit (Codex 2026-05-18 P1#2 fix).
     """
+    clip_id = lease.clip_id
     payload = [
         {
             "start_s": s.start_s,
@@ -329,14 +335,20 @@ def _persist_artifact(
         }
         for s in transcript
     ]
-    with connect() as conn:
+
+    def _do_persist(conn, new_version):
         conn.execute(
             """
             INSERT INTO clip_artifacts
               (clip_id, source_local_path, transcript_json,
                punch_segment_start_s, punch_segment_end_s,
-               has_music_in_source_segment, artifact_version, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+               has_music_in_source_segment, artifact_version, updated_at,
+               script_text, shot_list_json,
+               voice_audio_path, voice_runtime_s,
+               visuals_seconds_used, visuals_tier, visuals_cost_usd,
+               final_video_path, final_duration_s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'),
+                    NULL, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL)
             ON CONFLICT(clip_id) DO UPDATE SET
               source_local_path = excluded.source_local_path,
               transcript_json   = excluded.transcript_json,
@@ -344,7 +356,19 @@ def _persist_artifact(
               punch_segment_end_s   = excluded.punch_segment_end_s,
               has_music_in_source_segment = excluded.has_music_in_source_segment,
               artifact_version  = excluded.artifact_version,
-              updated_at        = datetime('now')
+              updated_at        = datetime('now'),
+              -- Downstream invalidation: any prior Writer/Voice/Visuals/
+              -- Compositor output was produced from the previous Editor
+              -- run; a re-edit makes it stale, so clear it here.
+              script_text       = NULL,
+              shot_list_json    = NULL,
+              voice_audio_path  = NULL,
+              voice_runtime_s   = NULL,
+              visuals_seconds_used = 0,
+              visuals_tier      = NULL,
+              visuals_cost_usd  = 0,
+              final_video_path  = NULL,
+              final_duration_s  = NULL
             """,
             (
                 clip_id,
@@ -353,13 +377,15 @@ def _persist_artifact(
                 start_s,
                 end_s,
                 has_music,
-                input_artifact_version,
+                new_version,
             ),
         )
         conn.execute(
             "UPDATE clips_candidate SET status = 'processing' WHERE id = ?",
             (clip_id,),
         )
+
+    lease.commit_artifact(_do_persist)
 
 
 def _quarantine_clip(
@@ -508,18 +534,19 @@ async def run_editor(clip_id: str) -> None:
                 method=_music_detector_method(),
             )
 
-            # ---------- Persist ----------
+            # ---------- Persist (atomic via lease.commit_artifact) ----------
+            # commit_artifact does version-check + data write + version
+            # bump in one BEGIN IMMEDIATE. It also sets
+            # lease.output_artifact_version + _artifact_committed so the
+            # exit handler skips the now-redundant legacy CAS.
             _persist_artifact(
-                clip_id,
+                lease,
                 source_local_path=str(dest_path),
                 transcript=transcript,
                 start_s=start_s,
                 end_s=end_s,
                 has_music=has_music,
-                input_artifact_version=lease.input_artifact_version,
             )
-
-            lease.output_artifact_version = lease.input_artifact_version + 1
 
             log(
                 agent="editor",
