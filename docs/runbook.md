@@ -177,6 +177,92 @@ The pipeline produces ~3 TikTok-targeted clips/day per `config/posting_schedule.
 
 ---
 
+## 8. Day 14 validation pilot gate (~30 days, recurring during pilot)
+
+This is the safety gate before multi-platform ramp. Per `docs/phase2_plan.md:755`, the pipeline must post 30 clips to a single platform and clear three independent thresholds before Day 15 unblocks:
+
+| Gate | Threshold | Why |
+|------|-----------|-----|
+| Content ID claim rate | **< 2%** | Fair-use defense holding; below "regular flagging" baseline |
+| Revenue per view (RPV) | **> $0.001** | Proves the funnel is *actually monetized*, not just visible |
+| Operator time | **< 45 min/day** | Per CLAUDE.md hard constraint; if higher, this isn't solo-operable |
+
+Default platform is **Instagram Reels** — historically the least claim-prone of the three. Override with `PLATFORM=youtube_shorts` (or `tiktok`) if you have a reason.
+
+### 8.1 Open the pilot
+
+```bash
+make pilot-start             # 30 clips to Instagram Reels, defaults
+# or
+make pilot-start PLATFORM=youtube_shorts CLIPS=20
+```
+
+This creates one row in `pilot_runs` with the gate thresholds baked in. At most one pilot can be active at a time — if you need to start over, `make pilot-finalize VERDICT=abandon` first.
+
+### 8.2 Daily operator loop during the pilot
+
+Each day (alongside step 7 manual TikTok uploads), spend 5–10 min logging what happened. The pilot has no automatic ingestion — Phase 2 has no live revenue API and no claim push listener, so the operator reads creator dashboards and records what they see.
+
+```bash
+# End of day — what was your total time on the pipeline?
+make pilot-record-time MINUTES=32 NOTE="manual IG upload + reviewed digest"
+
+# When the IG / YT / TikTok dashboard updates with revenue (often daily-ish):
+make pilot-record-revenue AMOUNT=0.42 SOURCE=ad_rev DETAIL="2026-05-19 IG payout"
+make pilot-record-revenue AMOUNT=1.10 SOURCE=affiliate DETAIL="3 clicks, 1 conversion"
+
+# If any clip gets a Content ID claim notification:
+make pilot-record-claim CLIP_ID=2026-05-19-1200-abc DETAIL="music match: Sony / Track X"
+```
+
+`SOURCE` values: `ad_rev` | `affiliate` | `creator_fund` | `other`.
+
+### 8.3 Check progress
+
+```bash
+make pilot-status
+```
+
+Shows: clips posted vs. target, total claims, current RPV, minutes/day rolling average. You're looking for "all three gates trending green" — if RPV is collapsing or claim rate is creeping up, you'd rather know on day 7 than day 30.
+
+### 8.4 Render verdict
+
+```bash
+make pilot-verdict
+```
+
+Three outcomes:
+
+- **PASS** — all three gates clear at ≥ target clip count. Day 15 unblocked; proceed to multi-platform ramp.
+- **FAIL** — gate criteria are at full sample but at least one failed. Verdict prints which gates failed. **Do not ramp.** Diagnose the failing dimension before retrying.
+- **INCONCLUSIVE** — sample too small. Keep posting.
+
+Exit code is 0 on PASS or INCONCLUSIVE, 2 on FAIL, so this can be chained from CI / cron.
+
+### 8.5 Close the pilot
+
+```bash
+make pilot-finalize VERDICT=pass NOTES="Day 14 cleared; ready for ramp"
+# or
+make pilot-finalize VERDICT=fail NOTES="RPV held at $0.0006; reconsidering hook templates"
+# or, if the pilot stalled (operator interruption, accounts paused, etc.):
+make pilot-finalize VERDICT=abandon NOTES="paused for 2 weeks; will restart fresh"
+```
+
+Closing the pilot frees the active slot for a new run. The closed row stays in `pilot_runs` for the audit trail.
+
+### 8.6 If the pilot FAILS
+
+Don't loop. The gate exists to surface load-bearing problems before they get expensive:
+
+- **Claim rate breach** → music detection is failing or fair-use commentary ratio is too low. Tighten the Compliance gate; review quarantine reasons; consider raising commentary-ratio threshold above 50%.
+- **RPV breach** → either monetization isn't enabled (YPP/MMF status) or the niche isn't paying enough. Re-check eligibility status, hook templates, and CTR on affiliate links. Consider switching primary platform.
+- **Operator-time breach** → automation gaps are showing. Profile your daily time, find the >10min step, automate or batch it before re-running.
+
+Open a fresh pilot only after addressing the specific failed dimension.
+
+---
+
 ## Status checklist
 
 - [ ] Step 1: Rename repo
@@ -187,5 +273,6 @@ The pipeline produces ~3 TikTok-targeted clips/day per `config/posting_schedule.
 - [x] Step 5: `make init-db && make test && make doctor` *(36/36 pass; 1 expected fail awaiting step 6)*
 - [ ] Step 6: Avatar reference image generated and committed
 - [ ] Step 7: (recurring) daily TikTok manual upload — kicks in once Phase 2 runs the pipeline end-to-end
+- [ ] Step 8: (recurring during pilot) Day 14 validation pilot gate — 30 clips, single platform, three thresholds
 
-Once steps 1, 3a, 3b, 4, 6 are ticked, **Phase 2** (replacing `NotImplementedError` stubs with live wiring) is unblocked.
+Once steps 1, 3a, 3b, 4, 6 are ticked, **Phase 2** (replacing `NotImplementedError` stubs with live wiring) is unblocked. Once the Phase 2 pipeline runs end-to-end, **step 8** gates the expansion to multi-platform.

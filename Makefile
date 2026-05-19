@@ -1,5 +1,7 @@
 .PHONY: help phase0 setup setup-apply init-db migrate test doctor publish visuals \
-        morning scout trending process digest optimize experiment rollback tiktok-confirm
+        morning scout trending process digest optimize experiment rollback tiktok-confirm \
+        pilot-start pilot-status pilot-verdict pilot-record-revenue pilot-record-time \
+        pilot-record-claim pilot-finalize
 
 # === Active targets (work today) ============================================
 
@@ -26,6 +28,15 @@ help:
 	@echo "  experiment NAME=<name>     open a bandit experiment"
 	@echo "  rollback CHANGE_ID=<id>    roll back an auto-applied change"
 	@echo "  tiktok-confirm CLIP_ID=<id> POST_ID=<id>  flip manual_pending → posted"
+	@echo ""
+	@echo "Day 14 validation pilot gate (operator-driven):"
+	@echo "  pilot-start [PLATFORM=instagram_reels] [CLIPS=30]    open a pilot run"
+	@echo "  pilot-status                                          show progress numbers"
+	@echo "  pilot-record-revenue AMOUNT=1.23 SOURCE=ad_rev        log observed revenue"
+	@echo "  pilot-record-time MINUTES=32                          log end-of-day op minutes"
+	@echo "  pilot-record-claim [CLIP_ID=<id>]                     log a Content ID claim"
+	@echo "  pilot-verdict                                         evaluate the 3 gate criteria"
+	@echo "  pilot-finalize VERDICT=pass|fail|abandon              close the pilot"
 
 phase0:
 	@echo "Phase 0 is complete. See docs/phase0_digest.md for the human approval digest."
@@ -101,6 +112,47 @@ ifndef CHANGE_ID
 	$(error "CHANGE_ID is required; usage: make rollback CHANGE_ID=<id>")
 endif
 	$(_PHASE2_NOT_WIRED)
+
+# === Day 14 validation pilot gate ==========================================
+# Operator-driven: pilot orchestration tooling exists, but the actual posting
+# + observing remains a manual exercise on the operator's end. See
+# docs/runbook.md "Pilot gate" for the daily loop.
+
+PLATFORM ?= instagram_reels
+CLIPS    ?= 30
+
+pilot-start:
+	python3 scripts/pilot.py start --platform $(PLATFORM) --clips $(CLIPS)
+
+pilot-status:
+	python3 scripts/pilot.py status
+
+pilot-record-revenue:
+ifndef AMOUNT
+	$(error "AMOUNT is required; usage: make pilot-record-revenue AMOUNT=1.23 SOURCE=ad_rev")
+endif
+ifndef SOURCE
+	$(error "SOURCE is required; usage: make pilot-record-revenue AMOUNT=1.23 SOURCE=ad_rev|affiliate|creator_fund|other")
+endif
+	python3 scripts/pilot.py record-revenue --amount $(AMOUNT) --source $(SOURCE) $(if $(DETAIL),--detail "$(DETAIL)",)
+
+pilot-record-time:
+ifndef MINUTES
+	$(error "MINUTES is required; usage: make pilot-record-time MINUTES=32")
+endif
+	python3 scripts/pilot.py record-time --minutes $(MINUTES) $(if $(NOTE),--note "$(NOTE)",)
+
+pilot-record-claim:
+	python3 scripts/pilot.py record-claim $(if $(CLIP_ID),--clip-id $(CLIP_ID),) $(if $(DETAIL),--detail "$(DETAIL)",)
+
+pilot-verdict:
+	python3 scripts/pilot.py verdict
+
+pilot-finalize:
+ifndef VERDICT
+	$(error "VERDICT is required; usage: make pilot-finalize VERDICT=pass|fail|abandon")
+endif
+	python3 scripts/pilot.py finalize --$(VERDICT) $(if $(NOTES),--notes "$(NOTES)",)
 
 tiktok-confirm:
 ifndef CLIP_ID
