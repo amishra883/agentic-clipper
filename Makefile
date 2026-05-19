@@ -19,10 +19,12 @@ help:
 	@echo "  publish          flush ready queue, respecting schedule (CLI wired)"
 	@echo "  phase0           (no-op; Phase 0 already complete — see docs/phase0_digest.md)"
 	@echo ""
+	@echo "Phase 2 pipeline:"
+	@echo "  process N=5      run end-to-end pipeline on next N curated candidates"
+	@echo ""
 	@echo "Phase 2 stubs (target prints 'not yet wired' and exits 1):"
 	@echo "  scout            run Scout once"
 	@echo "  trending         refresh data/trending.md"
-	@echo "  process N=5      run full pipeline on next N candidates"
 	@echo "  visuals CLIP_ID=<id>  re-run only Visuals stage"
 	@echo "  optimize         run Optimizer manually"
 	@echo "  experiment NAME=<name>     open a bandit experiment"
@@ -90,7 +92,7 @@ trending:
 
 N ?= 5
 process:
-	$(_PHASE2_NOT_WIRED)
+	python3 scripts/process.py --n $(N)
 
 visuals:
 ifndef CLIP_ID

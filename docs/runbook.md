@@ -177,6 +177,50 @@ The pipeline produces ~3 TikTok-targeted clips/day per `config/posting_schedule.
 
 ---
 
+## 7.5 Running the pipeline end-to-end
+
+`make process N=5` picks up to N candidates in `'curated'` status and runs them through Editor → Writer → Voice → Visuals → Compositor → Compliance → enqueue. Each clip that passes Compliance gets one `clips_ready` row per platform configured in `config/posting_schedule.yaml` (Instagram Reels, YouTube Shorts, TikTok), scheduled for the next available time slot in `America/New_York`.
+
+Prereqs: there has to be something to process. The orchestrator does NOT run Scout or Curator — those have their own cadences and cost models. Top up the queue first:
+
+```bash
+# Phase 2 wire-up still pending for these two — once they ship:
+make scout      # discover new candidates
+make curator    # promote discovered → curated
+
+# Then run the pipeline:
+make process N=5
+```
+
+The orchestrator prints a per-clip outcome table:
+
+```
+Requested:           5
+Processed:           5
+  → ready:           4
+  → quarantined:     1
+  → compliance fail: 0
+  → lease conflict:  0
+  → errored:         0
+
+Per-clip:
+  2026-05-18-0001-abc   ready
+  2026-05-18-0002-def   ready
+  2026-05-18-0003-ghi   quarantined  (editor: no_speech)
+  ...
+```
+
+Outcomes:
+- **ready** — clip passed Compliance and is in `clips_ready` waiting for `make publish`
+- **quarantined** — an upstream stage routed it to `/data/quarantine/`
+- **compliance fail** — composed successfully but the legal-defense gate blocked it (most common: commentary-ratio under 50%, music detected, missing attribution)
+- **lease conflict** — another agent had the lease; next run picks it up
+- **errored** — unexpected exception; check the digest for stack
+
+Re-running on the same clip is safe: stage leases handle idempotency, and `_enqueue_for_publish` skips platforms where a queued row already exists.
+
+---
+
 ## 8. Day 14 validation pilot gate (~30 days, recurring during pilot)
 
 This is the safety gate before multi-platform ramp. Per `docs/phase2_plan.md:755`, the pipeline must post 30 clips to a single platform and clear three independent thresholds before Day 15 unblocks:
