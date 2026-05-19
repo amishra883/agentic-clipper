@@ -23,17 +23,20 @@ import pytest
 from agents import writer
 from agents.db import init_schema
 from agents.models import Script, ShotListEntry
+from scripts.migrate import migrate
 
 
 # ---------- Local fixtures ----------
 
 @pytest.fixture
 def writer_db(monkeypatch):
-    """Isolated DB with a seed clips_candidate row in 'processing' status."""
+    """Isolated DB through the latest migration with a seed clips_candidate
+    row in 'processing' status."""
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "writer.db"
         monkeypatch.setenv("AGENTIC_CLIPPER_DB", str(db_path))
         init_schema(db_path)
+        migrate(db_path=db_path)
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """
@@ -253,3 +256,280 @@ def test_run_writer_persists_script_on_soft_only_violation(writer_db, tmp_quaran
         ).fetchone()
     assert row is not None
     assert row[0]  # non-empty script_text
+
+
+# ---------- Day 7 hardening (Codex Day 5-6 follow-through) ----------
+
+
+def test_token_budget_blocks_oversized_input():
+    """Codex E-12 — a runaway transcript (e.g., 60-minute VOD that
+    Editor failed to quarantine) must NOT proceed to the LLM. The token
+    cap is a structural safeguard, not a cost optimization."""
+    # Project tokens for an unrealistically large source excerpt.
+    big_text = "x" * (8000 * 5)  # 5x the 8000-token cap, charged at 4 chars/token
+    persona = _persona_with_do_not([])
+    projected = writer._project_tokens(big_text, "", persona)
+    with pytest.raises(writer.TokenBudgetExceeded, match="projected="):
+        writer._check_token_budget(projected, tokens_per_clip_max=8000)
+
+
+def test_token_budget_passes_normal_input():
+    """A typical transcript (title + small trending block) projects well
+    under the 8000-token cap."""
+    persona = _persona_with_do_not([])
+    projected = writer._project_tokens("Title of a clip", "hot:\n  - meme: x", persona)
+    writer._check_token_budget(projected, tokens_per_clip_max=8000)
+
+
+def test_token_budget_none_disables_enforcement():
+    """None cap means caller opted out — _check_token_budget must not
+    raise. Used in test scenarios; production always supplies a cap."""
+    writer._check_token_budget(99999999, tokens_per_clip_max=None)
+
+
+def test_writer_token_cap_quarantines_oversized_clip(
+    writer_db, tmp_quarantine, monkeypatch,
+):
+    """End-to-end: an oversized source_excerpt quarantines the clip
+    BEFORE the LLM is called. No costs row, no clip_artifacts row."""
+    # Force a giant source title on the candidate
+    with sqlite3.connect(writer_db) as conn:
+        conn.execute(
+            "UPDATE clips_candidate SET source_title = ? WHERE id = ?",
+            ("x" * (8000 * 5), "2026-05-17-1200-writer"),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {
+        "per_call_caps": {
+            "anthropic_tokens_per_clip_max": 8000,
+            "rewrite_loop_max_iterations": 3,
+            "anthropic_daily_usd_max": 3.0,
+        },
+        "line_items": {"anthropic_api_buffer": {"monthly_budget_usd": 40}},
+    })
+    monkeypatch.setattr(writer, "stale_check", lambda: False)
+    monkeypatch.setattr(writer, "_load_trending", lambda: "")
+
+    with pytest.raises(writer.WriterPolicyError) as excinfo:
+        asyncio.run(writer.run_writer("2026-05-17-1200-writer"))
+    assert "token_budget_exceeded" in excinfo.value.violations
+
+    with sqlite3.connect(writer_db) as conn:
+        status = conn.execute(
+            "SELECT status FROM clips_candidate WHERE id = ?",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()[0]
+        cost_count = conn.execute(
+            "SELECT COUNT(*) FROM costs WHERE clip_id = ?",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()[0]
+        artifact = conn.execute(
+            "SELECT 1 FROM clip_artifacts WHERE clip_id = ?",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()
+    assert status == "quarantined"
+    assert cost_count == 0
+    assert artifact is None
+
+
+def test_writer_budget_caps_loads_from_config(monkeypatch):
+    """Default caps come from config/budget.yaml. Tests that the
+    resolver picks up monthly + daily + token caps + rewrite-loop bound."""
+    monkeypatch.setattr(writer, "load", lambda name: {
+        "line_items": {"anthropic_api_buffer": {"monthly_budget_usd": 40}},
+        "per_call_caps": {
+            "anthropic_daily_usd_max": 3.0,
+            "anthropic_tokens_per_clip_max": 8000,
+            "rewrite_loop_max_iterations": 3,
+        },
+    })
+    caps = writer._writer_budget_caps()
+    assert caps["line_item_cap_usd"] == 40
+    assert caps["daily_cap_usd"] == 3.0
+    assert caps["tokens_per_clip_max"] == 8000
+    assert caps["rewrite_loop_max_iterations"] == 3
+
+
+def test_writer_budget_caps_falls_back_to_default_rewrite_loop(monkeypatch):
+    """If config is missing rewrite_loop_max_iterations, default = 3.
+    The token / dollar caps stay None — those MUST be in config (run_writer
+    will pass them straight through to reserve(), which treats None as
+    no enforcement; that's the test-only path, not production)."""
+    monkeypatch.setattr(writer, "load", lambda name: {})
+    caps = writer._writer_budget_caps()
+    assert caps["rewrite_loop_max_iterations"] == 3
+    assert caps["tokens_per_clip_max"] is None
+
+
+def test_persona_prompt_hash_stable():
+    """The hash MUST be deterministic — two calls with the same persona
+    return the same hash. The hash MUST also change when any
+    prompt-relevant field changes."""
+    p1 = _persona_with_do_not(["forbidden_phrase"])
+    p2 = _persona_with_do_not(["forbidden_phrase"])
+    p3 = _persona_with_do_not(["different_phrase"])
+    assert writer._persona_prompt_hash(p1) == writer._persona_prompt_hash(p2)
+    assert writer._persona_prompt_hash(p1) != writer._persona_prompt_hash(p3)
+
+
+def test_verify_persona_prompt_locked_handles_empty_suite(monkeypatch, tmp_path):
+    """When the eval suite is empty (no golden_*.json), locked must be
+    False — we can't claim drift-protection on zero data."""
+    empty_dir = tmp_path / "empty_suite"
+    empty_dir.mkdir()
+    monkeypatch.setattr(writer, "EVAL_SUITE_DIR", empty_dir)
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {})
+    result = writer.verify_persona_prompt_locked()
+    assert result["locked"] is False
+    assert result["total"] == 0
+
+
+def test_verify_persona_prompt_locked_passes_when_generator_matches_goldens(
+    monkeypatch, tmp_path,
+):
+    """The pass_ratio gate: generator returning the golden text scores
+    similarity=1.0 across the suite → locked=True."""
+    # Build a tiny suite with one non-placeholder golden
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "golden_001_real.json").write_text("""{
+      "id": "001-real-case",
+      "label": "test",
+      "input": {"_phase1_echo_golden": "hello world this is a script"},
+      "expected": {},
+      "_golden_output_text": "hello world this is a script"
+    }""")
+    monkeypatch.setattr(writer, "EVAL_SUITE_DIR", suite)
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {})
+
+    result = writer.verify_persona_prompt_locked()
+    assert result["locked"] is True
+    assert result["total"] == 1
+    assert "001-real-case" in result["passing_ids"]
+
+
+def test_verify_persona_prompt_locked_fails_on_drift(monkeypatch, tmp_path):
+    """When the generator emits drift-y text far from goldens,
+    similarity < threshold → locked=False → operator regenerates."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "golden_001_real.json").write_text("""{
+      "id": "001-real-case",
+      "label": "test",
+      "input": {"_phase1_echo_golden": "hello world this is a script"},
+      "expected": {},
+      "_golden_output_text": "hello world this is a script"
+    }""")
+    monkeypatch.setattr(writer, "EVAL_SUITE_DIR", suite)
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {})
+
+    def drift(payload):
+        return "completely different unrelated tokens"
+    result = writer.verify_persona_prompt_locked(generator=drift)
+    assert result["locked"] is False
+
+
+def test_writer_uses_stage_lease_and_bumps_artifact_version(
+    writer_db, tmp_quarantine, monkeypatch,
+):
+    """End-to-end: a successful Writer run leaves clip_artifacts with
+    artifact_version=1 (input was 0, lease bumps to input+1)."""
+
+    def _ok_script(persona: dict) -> Script:
+        return _good_script()
+
+    monkeypatch.setattr(writer, "_placeholder_script", _ok_script)
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {
+        "per_call_caps": {
+            "anthropic_tokens_per_clip_max": 8000,
+            "rewrite_loop_max_iterations": 3,
+            "anthropic_daily_usd_max": 3.0,
+        },
+        "line_items": {"anthropic_api_buffer": {"monthly_budget_usd": 40}},
+    })
+    monkeypatch.setattr(writer, "stale_check", lambda: False)
+    monkeypatch.setattr(writer, "_load_trending", lambda: "")
+
+    asyncio.run(writer.run_writer("2026-05-17-1200-writer"))
+
+    with sqlite3.connect(writer_db) as conn:
+        ver = conn.execute(
+            "SELECT artifact_version FROM clip_artifacts WHERE clip_id = ?",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()[0]
+        # pipeline_runs row recorded the lease completion
+        lease_row = conn.execute(
+            "SELECT status, output_artifact_version FROM pipeline_runs "
+            "WHERE clip_id = ? AND stage = 'writer'",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()
+    assert ver == 1
+    assert lease_row[0] == "succeeded"
+    assert lease_row[1] == 1
+
+
+def test_writer_lease_conflict_logs_info_and_reraises(writer_db, monkeypatch):
+    """A second Writer on the same clip raises LeaseConflict — the
+    orchestrator decides whether to wait or skip."""
+    from agents.stage_lease import LeaseConflict, stage_lease
+
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {
+        "per_call_caps": {
+            "anthropic_tokens_per_clip_max": 8000,
+            "rewrite_loop_max_iterations": 3,
+            "anthropic_daily_usd_max": 3.0,
+        },
+        "line_items": {"anthropic_api_buffer": {"monthly_budget_usd": 40}},
+    })
+    monkeypatch.setattr(writer, "stale_check", lambda: False)
+    monkeypatch.setattr(writer, "_load_trending", lambda: "")
+
+    with stage_lease("2026-05-17-1200-writer", stage="writer", ttl_seconds=60):
+        with pytest.raises(LeaseConflict):
+            asyncio.run(writer.run_writer("2026-05-17-1200-writer"))
+
+
+def test_writer_budget_exceeded_does_not_quarantine(
+    writer_db, tmp_quarantine, monkeypatch,
+):
+    """If the cost reservation fails (daily cap breached), the clip
+    stays in 'processing' — the next run cycle (after budget reset)
+    can pick it up. Quarantine is for VIOLATIONS, not budget pressure."""
+    # Pre-fill the daily anthropic_api_buffer so the reservation fails
+    with sqlite3.connect(writer_db) as conn:
+        conn.execute(
+            "INSERT INTO costs (ts, category, amount_usd, status) "
+            "VALUES (datetime('now'), 'anthropic_api_buffer', 4.0, 'succeeded')"
+        )
+        conn.commit()
+
+    monkeypatch.setattr(writer, "_active_persona", lambda cfg: _persona_with_do_not([]))
+    monkeypatch.setattr(writer, "load", lambda name: {
+        "per_call_caps": {
+            "anthropic_tokens_per_clip_max": 8000,
+            "rewrite_loop_max_iterations": 3,
+            "anthropic_daily_usd_max": 3.0,  # 4.0 already spent > 3.0 cap
+        },
+        "line_items": {"anthropic_api_buffer": {"monthly_budget_usd": 40}},
+    })
+    monkeypatch.setattr(writer, "stale_check", lambda: False)
+    monkeypatch.setattr(writer, "_load_trending", lambda: "")
+
+    from agents.costs import BudgetExceeded
+    with pytest.raises(BudgetExceeded):
+        asyncio.run(writer.run_writer("2026-05-17-1200-writer"))
+
+    with sqlite3.connect(writer_db) as conn:
+        status = conn.execute(
+            "SELECT status FROM clips_candidate WHERE id = ?",
+            ("2026-05-17-1200-writer",),
+        ).fetchone()[0]
+    # CRITICAL: budget-cap-fired clips stay in 'processing', NOT 'quarantined'
+    assert status == "processing"
