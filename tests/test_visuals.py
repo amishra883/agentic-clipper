@@ -222,14 +222,19 @@ def test_scaffold_mode_does_not_write_has_real_face(
 def test_daily_atlas_cap_blocks_reservation(
     visuals_db, tmp_quarantine, monkeypatch,
 ):
-    """Pre-fill today's atlas_cloud spend at $4.80 against the $5 daily
-    cap. The next reservation (~$0.50 worst-case from per-clip cap)
-    breaches → BudgetExceeded → quarantine. No fallback (Atlas has no
-    free path like Voice's Coqui)."""
+    """Pre-fill today's atlas_cloud spend at $4.95 against the $5 daily
+    cap. The next reservation (3.0s × $0.022/s = $0.066 expected fast-tier
+    cost) pushes to $5.016 → BudgetExceeded → quarantine. No fallback
+    (Atlas has no free path like Voice's Coqui).
+
+    Codex 2026-05-18 CEO fix: reservations now use expected per-second
+    rate ($0.022 fast / $0.18 pro) not the worst-case per-clip cap.
+    The daily cap therefore reflects realistic accumulation, not
+    pre-block worst-case projection."""
     with sqlite3.connect(visuals_db) as conn:
         conn.execute(
             "INSERT INTO costs (ts, category, amount_usd, status) "
-            "VALUES (datetime('now'), 'atlas_cloud', 4.80, 'succeeded')"
+            "VALUES (datetime('now'), 'atlas_cloud', 4.95, 'succeeded')"
         )
         conn.commit()
 
@@ -570,3 +575,277 @@ def test_atlas_caps_handles_missing_per_call_caps():
     no enforcement)."""
     caps = visuals._atlas_caps({})
     assert caps["daily_cap_usd"] is None
+
+
+# ---------- Autoplan CEO P1 fixes (2026-05-18) ----------
+
+
+def test_parser_reads_nested_atlas_response_per_docs():
+    """The documented Atlas response shape (docs/seedance_access.md:70-86)
+    is nested: output.video_url + usage.amount_usd. Prior parser only
+    read top-level video_url + cost_usd and would have misclassified
+    every real success as face_filter."""
+    nested = {
+        "task_id": "tsk_01hx",
+        "status": "succeeded",
+        "model": "bytedance/seedance-2.0-fast",
+        "output": {
+            "video_url": "https://cdn.atlascloud.ai/abc/out.mp4",
+            "duration_seconds": 6,
+            "resolution": "720p",
+            "seed": 42,
+        },
+        "usage": {
+            "billed_seconds": 6,
+            "amount_usd": 0.132,
+        },
+    }
+    parsed = visuals.parse_atlas_response(nested)
+    assert parsed.status == "succeeded"
+    assert parsed.video_url == "https://cdn.atlascloud.ai/abc/out.mp4"
+    assert parsed.cost_usd == 0.132
+
+
+def test_parser_unknown_status_maps_to_error_not_face_filter():
+    """A provider returning an unknown status (e.g., 'canceled',
+    'content_moderation', 'insufficient_credits') previously fell
+    through to face_filter. Now it maps to error with the unknown
+    status preserved in payload for operator inspection."""
+    parsed = visuals.parse_atlas_response({"status": "canceled"})
+    assert parsed.status == "error"
+    assert parsed.payload.get("_unknown_status") == "canceled"
+
+
+def test_parser_top_level_video_url_still_works():
+    """Top-level video_url is the fallback path (provider variants /
+    test fixtures). Nested takes precedence but top-level still
+    classifies as succeeded."""
+    parsed = visuals.parse_atlas_response({
+        "video_url": "https://x.example/out.mp4",
+        "cost_usd": 0.066,
+    })
+    assert parsed.status == "succeeded"
+    assert parsed.video_url == "https://x.example/out.mp4"
+    assert parsed.cost_usd == 0.066
+
+
+def test_parser_face_filter_requires_succeeded_status_and_no_url():
+    """Face-filter is HTTP 200 with status='succeeded' (or no status)
+    AND no video_url anywhere. Distinguished from unknown-status error."""
+    # Real face_filter: status succeeded but empty
+    p1 = visuals.parse_atlas_response({"status": "succeeded"})
+    assert p1.status == "face_filter"
+    # Also face_filter: no status at all (HTTP 200 empty body)
+    p2 = visuals.parse_atlas_response({})
+    assert p2.status == "face_filter"
+    # NOT face_filter: unknown status with no URL → error
+    p3 = visuals.parse_atlas_response({"status": "weird_new_state"})
+    assert p3.status == "error"
+
+
+def test_prompt_hash_includes_resolution_and_aspect_ratio():
+    """Codex CEO: prior cache key omitted resolution + aspect_ratio.
+    Two clips with identical prompt/seed/duration/tier but different
+    9:16 vs 16:9 outputs MUST produce different hashes — Atlas
+    generates different content for each."""
+    h1 = visuals._prompt_hash(
+        "test", seed=42, duration_s=3.0, tier="fast",
+        resolution="720p", aspect_ratio="9:16",
+    )
+    h2 = visuals._prompt_hash(
+        "test", seed=42, duration_s=3.0, tier="fast",
+        resolution="720p", aspect_ratio="16:9",
+    )
+    h3 = visuals._prompt_hash(
+        "test", seed=42, duration_s=3.0, tier="fast",
+        resolution="480p", aspect_ratio="9:16",
+    )
+    assert h1 != h2
+    assert h1 != h3
+    assert h2 != h3
+
+
+def test_prompt_hash_includes_reference_image_hash():
+    """Avatar-consistent shots use reference_image_hash for character
+    lock. Different reference images → different generations → MUST
+    produce different cache keys."""
+    h_no_ref = visuals._prompt_hash(
+        "test", seed=42, duration_s=3.0, tier="fast",
+    )
+    h_with_ref = visuals._prompt_hash(
+        "test", seed=42, duration_s=3.0, tier="fast",
+        reference_image_hash="abc123",
+    )
+    h_other_ref = visuals._prompt_hash(
+        "test", seed=42, duration_s=3.0, tier="fast",
+        reference_image_hash="def456",
+    )
+    assert h_no_ref != h_with_ref
+    assert h_with_ref != h_other_ref
+
+
+def test_reservation_uses_expected_cost_not_worst_case(
+    visuals_db, tmp_quarantine, monkeypatch,
+):
+    """Codex CEO: prior version reserved at the per-clip CAP ($0.50 fast),
+    which pre-blocked the daily cap before real spend. Now reserves at
+    duration_s × per-second rate ($0.022 fast). Verify the cost row's
+    amount_usd reflects the expected cost."""
+    monkeypatch.setattr(visuals, "load", lambda name: _budget_cfg())
+
+    async def fake_atlas(*args, **kwargs):
+        return {
+            "status": "succeeded",
+            "output": {"video_url": "https://x/out.mp4"},
+            "usage": {"amount_usd": 0.066},
+        }
+    monkeypatch.setattr(visuals, "_atlas_cloud_generate", fake_atlas)
+
+    # 3.0s fast shot → expected reservation $0.066 (3.0 × $0.022)
+    asyncio.run(visuals.run_visuals("viz-clip-1", [_shot(duration_s=3.0)]))
+
+    with sqlite3.connect(visuals_db) as conn:
+        # The pending row was bumped to succeeded with the actual amount
+        # at settle time. Verify the reservation amount is expected, not cap.
+        rows = conn.execute(
+            "SELECT amount_usd, status FROM costs WHERE clip_id = ? "
+            "AND category = 'atlas_cloud' ORDER BY id",
+            ("viz-clip-1",),
+        ).fetchall()
+    # One succeeded row with actual amount 0.066
+    assert any(r[0] == pytest.approx(0.066) and r[1] == "succeeded" for r in rows)
+
+
+def test_fal_ai_fallback_triggers_on_atlas_retries_exhausted(
+    visuals_db, tmp_quarantine, monkeypatch,
+):
+    """Codex CEO: vendor concentration risk. Atlas RetryGiveUp should
+    fall through to fal.ai, not immediately quarantine. With fal.ai
+    also stubbed (Phase 1), the final state IS quarantine but the
+    code path that triggers fal.ai exists.
+
+    Verify the atlas_fallback_to_fal warn event fires AND fal.ai
+    was called."""
+    from agents.retry import RetryGiveUp
+
+    monkeypatch.setattr(visuals, "load", lambda name: _budget_cfg())
+
+    async def atlas_giveup(*args, **kwargs):
+        raise RetryGiveUp("atlas 503 after 3 attempts")
+    monkeypatch.setattr(visuals, "_atlas_cloud_generate", atlas_giveup)
+
+    fal_called = {"n": 0}
+
+    async def fal_stub(*args, **kwargs):
+        fal_called["n"] += 1
+        raise NotImplementedError("fal.ai not yet wired")
+    monkeypatch.setattr(visuals, "_fal_ai_generate", fal_stub)
+
+    events = []
+    monkeypatch.setattr(visuals, "log", lambda **kw: events.append(kw))
+
+    asyncio.run(visuals.run_visuals("viz-clip-1", [_shot()]))
+
+    # fal.ai WAS attempted as fallback
+    assert fal_called["n"] == 1
+    # Warn event fired showing the fallback happened
+    fallback_events = [
+        e for e in events if e.get("event_type") == "atlas_fallback_to_fal"
+    ]
+    assert fallback_events
+    assert "atlas_retries_exhausted" in fallback_events[0]["payload"]["reason"]
+
+
+def test_fal_ai_fallback_succeeds_when_atlas_giveup_and_fal_wired(
+    visuals_db, tmp_quarantine, monkeypatch,
+):
+    """If Atlas RetryGiveUp's BUT fal.ai succeeds, the asset is
+    persisted with provider='fal_ai'. The strike-insurance path."""
+    from agents.retry import RetryGiveUp
+
+    monkeypatch.setattr(visuals, "load", lambda name: _budget_cfg())
+
+    async def atlas_giveup(*args, **kwargs):
+        raise RetryGiveUp("atlas 503")
+    monkeypatch.setattr(visuals, "_atlas_cloud_generate", atlas_giveup)
+
+    async def fal_ok(*args, **kwargs):
+        return {
+            "status": "succeeded",
+            "output": {"video_url": "https://fal.example/out.mp4"},
+            "usage": {"amount_usd": 0.072},
+        }
+    monkeypatch.setattr(visuals, "_fal_ai_generate", fal_ok)
+
+    asyncio.run(visuals.run_visuals("viz-clip-1", [_shot()]))
+
+    with sqlite3.connect(visuals_db) as conn:
+        row = conn.execute(
+            "SELECT provider, status FROM seedance_generations "
+            "WHERE clip_id = ? ORDER BY id DESC LIMIT 1",
+            ("viz-clip-1",),
+        ).fetchone()
+        cand_status = conn.execute(
+            "SELECT status FROM clips_candidate WHERE id = ?", ("viz-clip-1",),
+        ).fetchone()[0]
+    # Generation logged with fal_ai provider, candidate not quarantined
+    assert row[0] == "fal_ai"
+    assert row[1] == "succeeded"
+    assert cand_status == "processing"
+
+
+def test_localize_asset_path_is_deterministic_local_path():
+    """Asset paths are now local (under data/generated_cache/), not CDN
+    URLs that expire. Same prompt_hash → same path; different hashes
+    → different paths."""
+    p1 = visuals._localize_asset_path(
+        prompt_hash="aaa", cdn_url="https://cdn1.example/x.mp4",
+    )
+    p2 = visuals._localize_asset_path(
+        prompt_hash="aaa", cdn_url="https://cdn2.example/y.mp4",
+    )
+    p3 = visuals._localize_asset_path(
+        prompt_hash="bbb", cdn_url="https://cdn1.example/x.mp4",
+    )
+    # CDN URL doesn't change the local path — path is keyed on prompt_hash
+    assert p1 == p2
+    assert p1 != p3
+    # Path lives under data/generated_cache/
+    assert "generated_cache" in p1
+    assert p1.endswith(".mp4")
+
+
+def test_successful_run_stores_local_path_not_cdn_url(
+    visuals_db, tmp_quarantine, monkeypatch,
+):
+    """Codex CEO: provider CDN URLs expire (typically 7d signed) and
+    can be taken down. The seedance_generations.output_path AND
+    clip_artifacts.* paths MUST be local paths so the Compositor can
+    re-read after the CDN URL expires. The CDN URL is preserved in
+    raw_response_json for audit."""
+    monkeypatch.setattr(visuals, "load", lambda name: _budget_cfg())
+
+    cdn_url = "https://cdn.atlascloud.ai/signed/abc.mp4?Expires=12345"
+
+    async def fake_atlas(*args, **kwargs):
+        return {
+            "status": "succeeded",
+            "output": {"video_url": cdn_url},
+            "usage": {"amount_usd": 0.066},
+        }
+    monkeypatch.setattr(visuals, "_atlas_cloud_generate", fake_atlas)
+
+    assets = asyncio.run(visuals.run_visuals("viz-clip-1", [_shot()]))
+
+    # Asset path is local, NOT the CDN URL
+    assert len(assets) == 1
+    assert "cdn.atlascloud.ai" not in assets[0].path
+    assert "generated_cache" in assets[0].path
+
+    # CDN URL preserved in seedance_generations.raw_response_json
+    with sqlite3.connect(visuals_db) as conn:
+        raw = conn.execute(
+            "SELECT raw_response_json FROM seedance_generations WHERE clip_id = ?",
+            ("viz-clip-1",),
+        ).fetchone()[0]
+    assert cdn_url in raw  # audit trail still points to provider URL

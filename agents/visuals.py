@@ -67,6 +67,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / "data" / "generated_cache"
 QUARANTINE_DIR = REPO_ROOT / "data" / "quarantine"
 
+# Per-second cost of Seedance generations. Fast tier = $0.022/sec per
+# docs/seedance_access.md:28; pro tier ≈ $0.15-0.25/sec, use $0.18 as
+# midpoint for cost projection. The pre-call reservation uses these
+# rates (expected cost) rather than the per-clip cap (worst-case),
+# so 3 shots × 7 clips/day doesn't pre-reserve us out of the daily
+# cap before we've done any real work (Codex CEO 2026-05-18 finding).
+_FAST_USD_PER_SECOND = 0.022
+_PRO_USD_PER_SECOND = 0.18
+
 
 # ---------- Typed Atlas response parser (E-3) ----------
 
@@ -92,16 +101,21 @@ class AtlasResponse:
 
 
 def parse_atlas_response(response: Any) -> AtlasResponse:
-    """Classify a single Atlas Cloud response into one of six typed states.
+    """Classify a single Atlas Cloud response. Reads the documented
+    nested shape from docs/seedance_access.md:70-86 first
+    (`output.video_url`, `usage.amount_usd`), with top-level fallbacks
+    so test fixtures and provider variants both work.
 
-    Replaces the prior "if video_url then success else face_filter" check
-    that silently conflated three distinct failure modes:
-      - HTTP 200 with empty body          → face_filter
-      - HTTP 200 with status='error'      → error
-      - HTTP 429 (rate-limited)           → rate_limit (caller retries)
+    Codex 2026-05-18 CEO finding: an earlier version only read top-level
+    `video_url`/`cost_usd` and would have misclassified every documented
+    success as `face_filter`. This version reads nested first, top-level
+    second.
 
-    The parser is defensive: callers must NEVER trust the raw dict's
-    presence of `video_url` without going through this function.
+    Unknown provider statuses (i.e., not one of the six AtlasResponseStatus
+    values) no longer fall through to `face_filter` — they map to `error`
+    with the unknown status preserved in `payload['_unknown_status']`. A
+    real face-filter rejection is HTTP 200 with status='succeeded' (or
+    no status) AND no video_url anywhere in the payload.
     """
     if not isinstance(response, dict):
         return AtlasResponse(
@@ -110,6 +124,15 @@ def parse_atlas_response(response: Any) -> AtlasResponse:
             cost_usd=0.0,
             payload={"raw": repr(response)[:200]},
         )
+
+    # Read nested + top-level for both URL and cost.
+    output_block = response.get("output") or {}
+    usage_block = response.get("usage") or {}
+    nested_url = output_block.get("video_url") if isinstance(output_block, dict) else None
+    nested_amount = usage_block.get("amount_usd") if isinstance(usage_block, dict) else None
+    nested_billed = (
+        usage_block.get("billed_seconds") if isinstance(usage_block, dict) else None
+    )
 
     # Atlas-Cloud-style status field. Different providers use different
     # field names; we read the union for portability.
@@ -154,23 +177,41 @@ def parse_atlas_response(response: Any) -> AtlasResponse:
             payload=response,
         )
 
-    video_url = response.get("video_url") or response.get("url")
+    # Success: nested OR top-level video_url. The cost reads nested
+    # `usage.amount_usd` first (the documented Atlas field), falling back
+    # to top-level `cost_usd` for test fixtures and provider variants.
+    video_url = nested_url or response.get("video_url") or response.get("url")
     if video_url:
-        return AtlasResponse(
+        cost = _coerce_float(nested_amount) or _coerce_float(response.get("cost_usd")) or 0.0
+        out = AtlasResponse(
             status="succeeded",
             video_url=str(video_url),
-            cost_usd=_coerce_float(response.get("cost_usd")) or 0.0,
+            cost_usd=cost,
             payload=response,
         )
+        # Tag the response with the billed_seconds reading for downstream
+        # audit; it can differ from the requested duration_s when the
+        # provider truncates.
+        if nested_billed is not None:
+            out.payload = {**response, "_billed_seconds": nested_billed}
+        return out
 
-    # HTTP 200 with no video_url is the face-filter signature
-    # (Atlas-specific: ByteDance silently drops face-containing
-    # requests instead of returning an error code).
+    # No video_url anywhere. If we reach here with status='succeeded',
+    # that IS the face-filter signature. Otherwise (unknown / missing
+    # status), record as error with the raw status preserved so the
+    # operator can fingerprint the new provider state.
+    if provider_status in (None, "succeeded", "success", "completed"):
+        return AtlasResponse(
+            status="face_filter",
+            video_url=None,
+            cost_usd=0.0,
+            payload=response,
+        )
     return AtlasResponse(
-        status="face_filter",
+        status="error",
         video_url=None,
         cost_usd=0.0,
-        payload=response,
+        payload={**response, "_unknown_status": str(provider_status)},
     )
 
 
@@ -181,6 +222,33 @@ def _coerce_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _localize_asset_path(*, prompt_hash: str, cdn_url: str | None) -> str:
+    """Compute the on-disk path where a Seedance generation lives after
+    Phase 2 downloads the CDN bytes.
+
+    Codex 2026-05-18 CEO finding: prior code stored the provider's CDN
+    URL (e.g., https://cdn.atlascloud.ai/.../out.mp4) as
+    clip_artifacts.source_local_path. The URL expires (CDN signed URLs
+    typically have a 7d TTL) and the provider can take down the file
+    after MPA pressure — both destroy reproducibility for analysis +
+    audit. Asset paths are now deterministic local files under
+    data/generated_cache/, named by the prompt_hash so the Compositor
+    can find them after the Phase 2 download wires up.
+
+    Phase 1 contract: this function returns the LOCAL PATH the
+    downloaded MP4 would live at. The CDN URL is preserved in
+    seedance_generations.raw_response_json so analytics + dispute
+    flows can still see where it came from.
+
+    TODO(phase2): wire a download helper that reads cdn_url, streams
+    bytes to this local path with SHA verification, and falls back to
+    keeping the CDN URL only if the local write fails (then quarantine).
+    """
+    _ = cdn_url  # CDN URL is audited via raw_response_json; not used in the
+                 # path itself so cache lookups don't depend on URL freshness.
+    return str(CACHE_DIR / f"{prompt_hash}.mp4")
 
 
 # ---------- Provider stubs ----------
@@ -220,12 +288,116 @@ async def _fal_ai_generate(
     raise NotImplementedError("live mode not implemented in Phase 1 scaffold")
 
 
+async def _generate_with_fallback(
+    *,
+    shot: ShotListEntry,
+    chosen_tier: Tier,
+    clip_id: str,
+) -> tuple[Any, str, str | None]:
+    """Try Atlas Cloud first, fall through to fal.ai on retry-exhaustion.
+
+    Codex 2026-05-18 CEO finding: vendor concentration. The prior code
+    quarantined immediately on Atlas RetryGiveUp / TransientError —
+    pipeline halted on any Atlas incident. Now the failure path tries
+    fal.ai; if BOTH providers exhaust their retries, the caller
+    quarantines.
+
+    Returns `(response, provider_used, fallback_reason)`:
+      - On Atlas success: `(response, "atlas_cloud", None)`
+      - On fal.ai-fallback success: `(response, "fal_ai", "<atlas_reason>")`
+      - On both providers stubbed (Phase 1): `(None, "none", "scaffold")`
+      - On both providers exhausted: `(None, "none", "<reason>")`
+
+    The retry decorators on each provider call handle transient backoff;
+    this function only mediates the inter-provider fallback.
+    """
+    atlas_reason: str | None = None
+    try:
+        resp = await _atlas_cloud_generate(
+            shot.prompt,
+            duration_s=shot.duration_s,
+            tier=chosen_tier,
+            seed=None,
+            reference_image_path=None,
+        )
+        return resp, "atlas_cloud", None
+    except NotImplementedError:
+        # Phase 1 scaffold path — try the fal.ai stub too so the
+        # fallback code path is exercised. If it also raises
+        # NotImplementedError, the caller logs phase1_scaffold and
+        # does NOT quarantine.
+        try:
+            await _fal_ai_generate(
+                shot.prompt,
+                duration_s=shot.duration_s,
+                tier=chosen_tier,
+                seed=None,
+                reference_image_path=None,
+            )
+        except NotImplementedError:
+            return None, "none", "scaffold"
+        # If fal.ai is wired and Atlas is not, fall through to
+        # success below — unreachable in Phase 1 but explicit.
+        return None, "none", "atlas_scaffold_fal_returned"
+    except RetryGiveUp as exc:
+        atlas_reason = f"atlas_retries_exhausted: {exc}"
+        log(agent="visuals", event_type="atlas_fallback_to_fal",
+            level="warn", clip_id=clip_id,
+            payload={"reason": atlas_reason, "shot_type": shot.shot_type},
+            rationale="Atlas retries exhausted; trying fal.ai fallback")
+    except TransientError as exc:
+        atlas_reason = f"atlas_transient: {exc}"
+        log(agent="visuals", event_type="atlas_fallback_to_fal",
+            level="warn", clip_id=clip_id,
+            payload={"reason": atlas_reason, "shot_type": shot.shot_type},
+            rationale="Atlas raised TransientError; trying fal.ai fallback")
+
+    # Atlas failed → try fal.ai
+    try:
+        resp = await _fal_ai_generate(
+            shot.prompt,
+            duration_s=shot.duration_s,
+            tier=chosen_tier,
+            seed=None,
+            reference_image_path=None,
+        )
+        return resp, "fal_ai", atlas_reason
+    except NotImplementedError:
+        # fal.ai not yet wired AND Atlas failed → quarantine path.
+        return None, "none", atlas_reason or "fal_ai_unwired"
+    except (RetryGiveUp, TransientError) as exc:
+        return None, "none", f"{atlas_reason} | fal_ai_failed: {exc}"
+
+
 # ---------- Cache ----------
 
 
-def _prompt_hash(prompt: str, *, seed: int | None, duration_s: float, tier: Tier) -> str:
+def _prompt_hash(
+    prompt: str,
+    *,
+    seed: int | None,
+    duration_s: float,
+    tier: Tier,
+    resolution: str = "720p",
+    aspect_ratio: str = "9:16",
+    reference_image_hash: str | None = None,
+) -> str:
+    """Cache key for a Seedance generation. Includes the fields that
+    materially change the output: prompt, seed (character lock),
+    duration, tier (model variant), resolution, aspect_ratio, and
+    reference_image_hash (avatar identity).
+
+    Codex 2026-05-18 CEO finding: prior version omitted resolution +
+    aspect_ratio + reference_image_hash. Two clips with the same
+    prompt/seed/duration/tier but 9:16 vs 16:9 output would cache-
+    collide. The Atlas API REQUIRES both per docs/seedance_access.md:66,
+    so they must be in the key.
+    """
     h = hashlib.sha256()
-    h.update(f"{prompt}|{seed}|{duration_s}|{tier}".encode())
+    h.update(
+        f"{prompt}|{seed}|{duration_s}|{tier}|{resolution}|{aspect_ratio}|"
+        f"{reference_image_hash or ''}".encode()
+    )
     return h.hexdigest()
 
 
@@ -497,9 +669,13 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                     continue
 
                 # ---------- Cost reservation (E-13) ----------
-                # Projected cost from the per-clip cap; settled below with
-                # the actual cost from the typed response.
-                projected_cost = cost_cap  # worst-case projection
+                # Codex 2026-05-18 CEO finding: reserve at EXPECTED cost
+                # (per-second rate × duration), not the per-clip CAP. The
+                # cap protects the upper bound at settle time; reserving
+                # at cap pre-blocks the daily budget far below operational
+                # throughput.
+                per_sec = _PRO_USD_PER_SECOND if chosen_tier == "pro" else _FAST_USD_PER_SECOND
+                projected_cost = round(shot.duration_s * per_sec, 4)
                 try:
                     reservation_id = reserve(
                         category="atlas_cloud",
@@ -524,43 +700,36 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                         rationale="atlas_cloud_daily_usd_max exceeded; clip quarantined")
                     return assets
 
-                # ---------- Provider call (with retry on transient) ----------
-                response: Any = None
-                try:
-                    response = await _atlas_cloud_generate(
-                        shot.prompt,
-                        duration_s=shot.duration_s,
-                        tier=chosen_tier,
-                        seed=None,
-                        reference_image_path=None,
-                    )
-                except NotImplementedError:
+                # ---------- Provider call: Atlas primary → fal.ai fallback ----------
+                # Codex 2026-05-18 CEO finding: vendor concentration. Atlas
+                # RetryGiveUp / TransientError now falls through to fal.ai
+                # via _try_fal_ai_fallback() before quarantining. Both
+                # providers stubbed in Phase 1 → falls through to
+                # quarantine, but the code path exists for Phase 2 wiring.
+                response, provider_used, fallback_reason = await _generate_with_fallback(
+                    shot=shot,
+                    chosen_tier=chosen_tier,
+                    clip_id=clip_id,
+                )
+
+                if response is None:
+                    # Both providers failed (scaffold mode → fal.ai also
+                    # NotImplementedError, falls through here).
                     settle(reservation_id, actual_amount_usd=0.0, status="failed")
-                    log(agent="visuals", event_type="phase1_scaffold", clip_id=clip_id,
-                        payload={"shot_type": shot.shot_type, "tier": chosen_tier},
-                        rationale="Atlas Cloud Seedance call stubbed in Phase 1")
-                    continue
-                except RetryGiveUp as exc:
-                    settle(reservation_id, actual_amount_usd=0.0, status="failed")
+                    if fallback_reason == "scaffold":
+                        log(agent="visuals", event_type="phase1_scaffold", clip_id=clip_id,
+                            payload={"shot_type": shot.shot_type, "tier": chosen_tier},
+                            rationale="Atlas + fal.ai stubbed in Phase 1")
+                        continue
                     _quarantine_clip(
                         clip_id,
-                        f"atlas_retries_exhausted: {exc}",
+                        f"all_providers_failed: {fallback_reason}",
                     )
-                    log(agent="visuals", event_type="atlas_retries_exhausted",
+                    log(agent="visuals", event_type="all_providers_failed",
                         level="warn", clip_id=clip_id,
                         payload={"shot_type": shot.shot_type, "tier": chosen_tier,
-                                 "error": str(exc)},
-                        rationale="Atlas Cloud retries exhausted; clip quarantined")
-                    return assets
-                except TransientError as exc:
-                    # TransientError reaches the caller only when the test
-                    # patch bypasses the retry decorator. In production
-                    # the decorator catches it and either retries or
-                    # wraps in RetryGiveUp.
-                    settle(reservation_id, actual_amount_usd=0.0, status="failed")
-                    _quarantine_clip(
-                        clip_id, f"atlas_transient_error: {exc}",
-                    )
+                                 "reason": fallback_reason},
+                        rationale="Atlas + fal.ai both exhausted; clip quarantined")
                     return assets
 
                 # ---------- Typed response parsing (E-3) ----------
@@ -589,7 +758,7 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                 if parsed.status == "face_filter":
                     settle(reservation_id, actual_amount_usd=0.0, status="failed")
                     _log_generation(
-                        clip_id, provider="atlas_cloud",
+                        clip_id, provider=provider_used,
                         model_version=f"seedance-2.0-{chosen_tier}", tier=chosen_tier,
                         prompt=shot.prompt, reference_image_hash=None, seed=None,
                         duration_s=shot.duration_s, cost_usd=0.0,
@@ -602,14 +771,14 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                     )
                     log(agent="visuals", event_type="face_filter_rejection",
                         level="blocked", clip_id=clip_id,
-                        payload={"shot_type": shot.shot_type},
+                        payload={"shot_type": shot.shot_type, "provider": provider_used},
                         rationale="provider returned 200 with no video_url; clip quarantined")
                     return assets
 
                 if parsed.status == "error":
                     settle(reservation_id, actual_amount_usd=0.0, status="failed")
                     _log_generation(
-                        clip_id, provider="atlas_cloud",
+                        clip_id, provider=provider_used,
                         model_version=f"seedance-2.0-{chosen_tier}", tier=chosen_tier,
                         prompt=shot.prompt, reference_image_hash=None, seed=None,
                         duration_s=shot.duration_s, cost_usd=0.0,
@@ -617,7 +786,7 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                         raw_response=parsed.payload,
                     )
                     _quarantine_clip(
-                        clip_id, "atlas_cloud returned error state",
+                        clip_id, f"{provider_used} returned error state",
                     )
                     return assets
 
@@ -662,20 +831,32 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                 # Settle the cost reservation with the actual amount.
                 settle(reservation_id, actual_amount_usd=actual_cost, status="succeeded")
 
+                # Codex 2026-05-18 CEO finding: storing the provider's CDN
+                # URL as asset_path breaks reproducibility on expiry /
+                # provider takedown. _localize_asset_path returns a
+                # deterministic local path under data/generated_cache/;
+                # Phase 2 wiring downloads the CDN bytes to that path
+                # before returning. The CDN URL is preserved in the
+                # seedance_generations.raw_response_json column for audit.
+                local_path = _localize_asset_path(
+                    prompt_hash=prompt_hash,
+                    cdn_url=parsed.video_url,
+                )
+
                 asset = GeneratedAsset(
-                    path=str(parsed.video_url),
+                    path=local_path,
                     duration_s=shot.duration_s,
                     cost_usd=actual_cost,
                     tier=chosen_tier,
-                    provider="atlas_cloud",
+                    provider=provider_used,
                     prompt=shot.prompt,
                 )
                 _log_generation(
-                    clip_id, provider="atlas_cloud",
+                    clip_id, provider=provider_used,
                     model_version=f"seedance-2.0-{chosen_tier}", tier=chosen_tier,
                     prompt=shot.prompt, reference_image_hash=None, seed=None,
                     duration_s=shot.duration_s, cost_usd=actual_cost,
-                    status="succeeded", output_path=asset.path,
+                    status="succeeded", output_path=local_path,
                     raw_response=parsed.payload,
                 )
                 _cache_insert(prompt_hash, asset)
