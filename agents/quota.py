@@ -111,16 +111,28 @@ def _ensure_quota_schema() -> None:
 
 
 def used_in_last_24h(platform: str, account_id: str) -> int:
-    """Count uploads (attempted OR succeeded) in the rolling 24h window.
-    Failed attempts also count — a 4xx-class rejection still consumed
-    quota on the platform side."""
+    """Count uploads in the rolling 24h window. One upload = one row
+    (status is updated in place, never appended).
+
+    Codex 2026-05-18 P1#1: the prior query did lexical `ts >= datetime(...)`
+    which compared an ISO `'2026-05-17T12:00:00+00:00'` against a SQLite
+    `'2026-05-17 13:00:00'` — `T` > space lexically, so the 12pm row
+    counted as fresh against the 1pm threshold (it isn't). Switched to
+    `strftime('%s', ts)` Unix-epoch compare, which parses BOTH formats
+    correctly.
+
+    Codex 2026-05-18 P1#3: prior code appended a separate `succeeded`
+    row after the `attempted` row, so each upload counted twice. Now
+    `resolve_attempt()` UPDATEs the same row in place; one row per
+    upload regardless of outcome.
+    """
     _ensure_quota_schema()
     with connect() as conn:
         row = conn.execute(
             """
             SELECT COUNT(*) AS used FROM publishing_quota
              WHERE platform = ? AND account_id = ?
-               AND ts >= datetime('now', '-24 hours')
+               AND strftime('%s', ts) >= strftime('%s', 'now', '-24 hours')
                AND status IN ('attempted','succeeded','failed')
             """,
             (platform, account_id),
@@ -173,6 +185,70 @@ def check_quota_or_block(
         )
 
 
+def start_attempt(
+    platform: str,
+    account_id: str,
+    *,
+    clip_id: str | None,
+) -> int:
+    """Insert a single 'attempted' row in publishing_quota and return its
+    rowid. The Publisher calls this BEFORE the upload so a mid-upload
+    crash still consumes quota (the platform side already saw the
+    request). After the upload resolves, `resolve_attempt()` UPDATEs
+    this same row to 'succeeded' or 'failed' — one row per upload
+    regardless of outcome.
+
+    Codex 2026-05-18 P1#3: prior `record_attempt('attempted')` +
+    `record_attempt('succeeded')` appended TWO rows. Cap of 6 was
+    exhausted at 3 real posts. Now upload = single in-place row.
+    """
+    _ensure_quota_schema()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO publishing_quota
+              (platform, account_id, ts, status, clip_id, platform_post_id)
+            VALUES (?, ?, ?, 'attempted', ?, NULL)
+            """,
+            (
+                platform, account_id,
+                datetime.now(timezone.utc).isoformat(),
+                clip_id,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def resolve_attempt(
+    attempt_id: int,
+    *,
+    status: str,
+    platform_post_id: str | None = None,
+) -> None:
+    """UPDATE the 'attempted' row to 'succeeded' or 'failed' in place.
+    Idempotent: if the row was already resolved by a prior call (e.g.,
+    retry path), the second UPDATE is a no-op (WHERE status='attempted'
+    filters it out)."""
+    if status not in ("succeeded", "failed"):
+        raise ValueError(
+            f"resolve_attempt: status must be 'succeeded' or 'failed', "
+            f"got {status!r}"
+        )
+    _ensure_quota_schema()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE publishing_quota
+               SET status = ?, platform_post_id = ?
+             WHERE id = ? AND status = 'attempted'
+            """,
+            (status, platform_post_id, attempt_id),
+        )
+
+
+# Back-compat shim. Tests that pre-date the split-API still use the
+# single-call form; production code (publisher.py) uses start_attempt +
+# resolve_attempt directly so the row-per-upload invariant holds.
 def record_attempt(
     platform: str,
     account_id: str,
@@ -181,15 +257,10 @@ def record_attempt(
     status: str,
     platform_post_id: str | None = None,
 ) -> None:
-    """Append a row to publishing_quota. status is one of:
-    'attempted' (recorded BEFORE the upload call so a crash mid-upload
-    still consumes quota), 'succeeded' (post landed), 'failed' (4xx /
-    5xx after retries).
-
-    The 'attempted' row is upgraded to 'succeeded' or 'failed' by the
-    caller AFTER the upload resolves — but the attempted row itself is
-    NEVER removed. A crashed upload still consumed quota on the
-    platform side; we must reflect that locally."""
+    """Compat shim — appends one row at the requested status. Used by
+    tests that simulate prior rows directly; production callers must
+    use start_attempt + resolve_attempt for the row-per-upload
+    invariant."""
     _ensure_quota_schema()
     if status not in ("attempted", "succeeded", "failed"):
         raise ValueError(f"invalid status {status!r}")
@@ -211,6 +282,8 @@ def record_attempt(
 __all__ = [
     "check_quota_or_block",
     "current_usage",
+    "start_attempt",
+    "resolve_attempt",
     "record_attempt",
     "used_in_last_24h",
     "QuotaExceeded",

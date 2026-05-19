@@ -423,6 +423,75 @@ def test_quarantine_skipped_when_compose_in_scaffold_mode(
     assert status != "quarantined"
 
 
+def test_quarantine_marks_pipeline_run_failed_not_succeeded(
+    compositor_db, tmp_compositor_dirs, monkeypatch,
+):
+    """Codex 2026-05-18 P1#4: prior code did `return None` from inside
+    the `with stage_lease()` block on duration / promote failure.
+    The lease exited cleanly → pipeline_runs.status='succeeded' while
+    the clip was actually quarantined. Audit said success, reality
+    said quarantine — irreconcilable for downstream reconciliation.
+
+    The fix: raise CompositionFailed inside the lease; the lease's
+    exception handler marks pipeline_runs as 'failed'; the outer
+    handler completes the quarantine flow."""
+
+    async def fake_compose(*args, **kwargs):
+        dest = kwargs["dest_path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"truncated render")
+        return 28.0  # claim success from compose
+    monkeypatch.setattr(compositor, "_ffmpeg_compose", fake_compose)
+    _patch_ffprobe(monkeypatch, stdout="2.0\n")  # 2s vs planned 28s → drift
+
+    composited = asyncio.run(compositor.run_compositor("comp-clip-1"))
+    assert composited is None  # quarantine path returns None
+
+    with sqlite3.connect(compositor_db) as conn:
+        # Candidate quarantined
+        cand_status = conn.execute(
+            "SELECT status FROM clips_candidate WHERE id = ?", ("comp-clip-1",),
+        ).fetchone()[0]
+        # Pipeline run row MUST be 'failed', not 'succeeded'
+        run_row = conn.execute(
+            "SELECT status, failure_reason FROM pipeline_runs "
+            "WHERE clip_id = ? AND stage = 'compositor'",
+            ("comp-clip-1",),
+        ).fetchone()
+    assert cand_status == "quarantined"
+    assert run_row[0] == "failed"
+    assert "CompositionFailed" in (run_row[1] or "")
+
+
+def test_atomic_promote_failure_also_marks_pipeline_failed(
+    compositor_db, tmp_compositor_dirs, monkeypatch,
+):
+    """The other branch of P1#4: os.replace raises (cross-device
+    rename, perms). Lease must be 'failed', clip 'quarantined'."""
+
+    async def fake_compose(*args, **kwargs):
+        dest = kwargs["dest_path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x")
+        return 28.0
+    monkeypatch.setattr(compositor, "_ffmpeg_compose", fake_compose)
+    _patch_ffprobe(monkeypatch, stdout="28.0\n")  # duration fine
+
+    def fail_replace(src, dst):
+        raise OSError("simulated cross-device rename")
+    monkeypatch.setattr("os.replace", fail_replace)
+
+    asyncio.run(compositor.run_compositor("comp-clip-1"))
+
+    with sqlite3.connect(compositor_db) as conn:
+        run_row = conn.execute(
+            "SELECT status FROM pipeline_runs "
+            "WHERE clip_id = ? AND stage = 'compositor'",
+            ("comp-clip-1",),
+        ).fetchone()
+    assert run_row[0] == "failed"
+
+
 def test_partial_file_cleaned_up_on_promote_failure(
     compositor_db, tmp_compositor_dirs, monkeypatch,
 ):

@@ -381,18 +381,25 @@ async def run_compositor(clip_id: str) -> CompositedClip | None:
                     rationale="ffmpeg composition stubbed in Phase 1")
 
             if composition_succeeded:
+                # Codex 2026-05-18 P1#4: prior code did `return None` from
+                # INSIDE the `with stage_lease(...)` block on duration /
+                # promote failure. The lease then exited cleanly and
+                # _mark_done flipped pipeline_runs.status to 'succeeded'
+                # while the clip was actually quarantined. Now we raise
+                # CompositionFailed; the OUTER handler catches it, marks
+                # the lease as failed (via the with-block's exception
+                # path), quarantines, cleans up, and returns None.
                 try:
                     final_duration = _verify_composition_duration(
                         partial, planned_s=planned_duration,
                     )
                 except CompositionFailed as exc:
                     _cleanup_partial(partial)
-                    _quarantine_clip(clip_id, f"duration_verification_failed: {exc}")
                     log(agent="compositor", event_type="composition_failed",
                         level="warn", clip_id=clip_id,
                         payload={"error": str(exc)},
-                        rationale="post-compose ffprobe gate fired; clip quarantined")
-                    return None
+                        rationale="post-compose ffprobe gate fired; clip will quarantine")
+                    raise  # propagate out of lease so it marks failed
                 # Atomic promote: the partial file becomes the final file
                 # in one inode swap. Readers (Compliance, Publisher) never
                 # see a torn write.
@@ -400,10 +407,9 @@ async def run_compositor(clip_id: str) -> CompositedClip | None:
                     _atomic_promote(partial, dest_path)
                 except OSError as exc:
                     _cleanup_partial(partial)
-                    _quarantine_clip(
-                        clip_id, f"atomic_rename_failed: {exc}",
-                    )
-                    return None
+                    raise CompositionFailed(
+                        f"atomic_rename_failed: {exc}"
+                    ) from exc
 
             _persist_composition(lease, str(dest_path), final_duration)
 
@@ -424,6 +430,13 @@ async def run_compositor(clip_id: str) -> CompositedClip | None:
             level="info", clip_id=clip_id, payload={},
             rationale="another Compositor holds the compositor lease; backing off")
         raise
+    except CompositionFailed as exc:
+        # Codex 2026-05-18 P1#4: raised from inside the lease, so the
+        # lease's exit handler already marked pipeline_runs as 'failed'.
+        # We finish the quarantine flow here so audit trail and clip
+        # status are consistent.
+        _quarantine_clip(clip_id, str(exc))
+        return None
 
     def _tri(v: Any) -> bool | None:
         if v is None:

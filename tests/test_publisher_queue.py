@@ -295,3 +295,85 @@ def test_unknown_mode_marks_failed_not_silent(queue_db, monkeypatch):
         ).fetchone()
     assert row[0] == "failed"
     assert "carrier_pigeon" in (row[1] or "")
+
+
+# ---------- Codex 2026-05-18 P1#2: quota-exceeded clip stays in queue ----------
+
+
+def test_quota_exceeded_returns_clip_to_queued_status(queue_db, monkeypatch):
+    """Codex P1#2: prior flow let _pick_next_clip flip the row to
+    'posting' and then `continue` on QuotaExceeded, leaving the clip
+    permanently in 'posting' (never re-picked because the SELECT
+    filters on status='queued'). The fix calls _requeue_clip() in
+    the QuotaExceeded path so the next run can pick the clip again
+    once the rolling 24h window opens or a backup account is used."""
+    from agents import quota
+
+    def _fake_load(name: str) -> dict:
+        return {"platforms": {"tiktok": {"mode": "api"}}}
+    monkeypatch.setattr(publisher, "load", _fake_load)
+
+    clip_id = "2026-05-17-1200-quotablock"
+    # Create publishing_quota schema BEFORE opening the test's connection,
+    # otherwise quota._ensure_quota_schema deadlocks against our held write lock.
+    quota._ensure_quota_schema()
+    with sqlite3.connect(queue_db) as conn:
+        _seed_candidate(conn, clip_id)
+        row_id = _seed_ready_row(conn, clip_id, target_platform="tiktok",
+                                 account_id="tiktok-acct-cap")
+        _seed_compliance_row(conn, clip_id, passed=True)
+        # Pre-fill tiktok quota for this account so the next attempt breaches.
+        for i in range(6):
+            conn.execute(
+                "INSERT INTO publishing_quota (platform, account_id, ts, status, clip_id) "
+                "VALUES ('tiktok', 'tiktok-acct-cap', ?, 'succeeded', ?)",
+                (datetime.now(timezone.utc).isoformat(), f"prior-{i}"),
+            )
+        conn.commit()
+
+    asyncio.run(publisher.run_publisher())
+
+    with sqlite3.connect(queue_db) as conn:
+        status = conn.execute(
+            "SELECT status FROM clips_ready WHERE id = ?", (row_id,)
+        ).fetchone()[0]
+    # Codex P1#2 fix: clip MUST be 'queued', not 'posting' (the broken state)
+    # and not 'failed' (which would remove it from the queue entirely).
+    assert status == "queued"
+
+
+def test_requeue_clip_reverts_posting_to_queued(queue_db):
+    """The _requeue_clip helper used by the quota path. Verifies the
+    state transition is conditional (only flips 'posting' rows)."""
+    clip_id = "2026-05-17-1200-requeue"
+    with sqlite3.connect(queue_db) as conn:
+        _seed_candidate(conn, clip_id)
+        row_id = _seed_ready_row(conn, clip_id, status="posting")
+        conn.commit()
+
+    publisher._requeue_clip(row_id)
+
+    with sqlite3.connect(queue_db) as conn:
+        status = conn.execute(
+            "SELECT status FROM clips_ready WHERE id = ?", (row_id,)
+        ).fetchone()[0]
+    assert status == "queued"
+
+
+def test_requeue_clip_is_no_op_on_already_posted_row(queue_db):
+    """If a clip has moved past 'posting' (succeeded → 'posted',
+    or operator-cancelled), requeue MUST NOT silently flip it back
+    to 'queued'. Belt-and-suspenders against a race."""
+    clip_id = "2026-05-17-1200-posted"
+    with sqlite3.connect(queue_db) as conn:
+        _seed_candidate(conn, clip_id)
+        row_id = _seed_ready_row(conn, clip_id, status="posted")
+        conn.commit()
+
+    publisher._requeue_clip(row_id)
+
+    with sqlite3.connect(queue_db) as conn:
+        status = conn.execute(
+            "SELECT status FROM clips_ready WHERE id = ?", (row_id,)
+        ).fetchone()[0]
+    assert status == "posted"  # untouched

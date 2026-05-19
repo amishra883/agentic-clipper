@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -194,3 +195,109 @@ def test_remaining_quota_never_negative(quota_db):
     assert usage.used_24h == 10
     assert usage.daily_max == 6
     assert usage.remaining == 0
+
+
+# ---------- Codex 2026-05-18 P1 fixes ----------
+
+
+def test_quota_window_uses_epoch_compare_not_lexical(quota_db):
+    """Codex P1#1: prior code did `ts >= datetime('now','-24 hours')`
+    which lexically compared ISO `'2026-05-17T12:00:00+00:00'` against
+    `'2026-05-17 13:00:00'`. `T` > space, so the 12pm row counted as
+    fresh against a 1pm threshold. Verify ISO-formatted rows that
+    are OLDER than 24h drop out of the count.
+
+    The fix: `strftime('%s', ts)` parses BOTH formats to Unix epoch,
+    making the comparison time-correct."""
+    import sqlite3
+    quota._ensure_quota_schema()
+    with sqlite3.connect(quota_db) as conn:
+        # Row from 25 hours ago, in production's ISO-T-offset format
+        conn.execute(
+            """
+            INSERT INTO publishing_quota (platform, account_id, ts, status, clip_id)
+            VALUES ('tiktok', 'acct-iso', ?, 'succeeded', 'old-iso')
+            """,
+            ((datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),),
+        )
+        # Row from 12 hours ago, also ISO format — SHOULD count
+        conn.execute(
+            """
+            INSERT INTO publishing_quota (platform, account_id, ts, status, clip_id)
+            VALUES ('tiktok', 'acct-iso', ?, 'succeeded', 'fresh-iso')
+            """,
+            ((datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(),),
+        )
+        conn.commit()
+    # 25h row dropped, 12h row counted = 1
+    assert quota.used_in_last_24h("tiktok", "acct-iso") == 1
+
+
+def test_start_attempt_then_resolve_yields_one_row(quota_db):
+    """Codex P1#3: prior `record_attempt('attempted') +
+    record_attempt('succeeded')` appended TWO rows for ONE upload.
+    A cap of 6 was exhausted at 3 real posts. Verify the new
+    start_attempt → resolve_attempt path produces exactly one row
+    per upload regardless of outcome."""
+    import sqlite3
+
+    aid = quota.start_attempt("tiktok", "acct-1", clip_id="c1")
+    assert isinstance(aid, int)
+    quota.resolve_attempt(aid, status="succeeded", platform_post_id="post-123")
+
+    with sqlite3.connect(quota_db) as conn:
+        rows = conn.execute(
+            "SELECT id, status, platform_post_id FROM publishing_quota "
+            "WHERE platform = 'tiktok' AND account_id = 'acct-1' "
+            "ORDER BY id"
+        ).fetchall()
+    # Exactly ONE row — start_attempt inserted, resolve_attempt updated in place
+    assert len(rows) == 1
+    assert rows[0][0] == aid
+    assert rows[0][1] == "succeeded"
+    assert rows[0][2] == "post-123"
+    # And it counts as ONE toward the rolling window
+    assert quota.used_in_last_24h("tiktok", "acct-1") == 1
+
+
+def test_start_attempt_failure_path_one_row(quota_db):
+    """A failed upload also produces exactly one row."""
+    aid = quota.start_attempt("tiktok", "acct-1", clip_id="c1")
+    quota.resolve_attempt(aid, status="failed")
+    assert quota.used_in_last_24h("tiktok", "acct-1") == 1
+
+
+def test_six_successful_uploads_consume_exactly_six(quota_db):
+    """End-to-end: 6 uploads (start + resolve each) → 6 rows → cap
+    exhausted. Prior bug: 12 rows → cap exhausted at 3 uploads."""
+    for i in range(6):
+        aid = quota.start_attempt("tiktok", "acct-1", clip_id=f"c{i}")
+        quota.resolve_attempt(aid, status="succeeded", platform_post_id=f"p{i}")
+    assert quota.used_in_last_24h("tiktok", "acct-1") == 6
+    # 7th would breach
+    with pytest.raises(quota.QuotaExceeded):
+        quota.check_quota_or_block("tiktok", "acct-1")
+
+
+def test_resolve_attempt_rejects_invalid_status(quota_db):
+    aid = quota.start_attempt("tiktok", "acct-1", clip_id="c1")
+    with pytest.raises(ValueError, match="must be 'succeeded' or 'failed'"):
+        quota.resolve_attempt(aid, status="garbage")
+
+
+def test_resolve_attempt_idempotent_on_already_resolved_row(quota_db):
+    """Second resolve_attempt on the same id is a no-op (WHERE status=
+    'attempted' filters it out). Used by retry paths that might
+    double-call."""
+    import sqlite3
+    aid = quota.start_attempt("tiktok", "acct-1", clip_id="c1")
+    quota.resolve_attempt(aid, status="succeeded", platform_post_id="p1")
+    # Second call must NOT change the row
+    quota.resolve_attempt(aid, status="failed")
+    with sqlite3.connect(quota_db) as conn:
+        row = conn.execute(
+            "SELECT status, platform_post_id FROM publishing_quota WHERE id = ?",
+            (aid,),
+        ).fetchone()
+    assert row[0] == "succeeded"
+    assert row[1] == "p1"

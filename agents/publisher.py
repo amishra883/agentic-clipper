@@ -35,7 +35,12 @@ from pathlib import Path
 from agents.config import load
 from agents.db import connect
 from agents.events import log
-from agents.quota import QuotaExceeded, check_quota_or_block, record_attempt
+from agents.quota import (
+    QuotaExceeded,
+    check_quota_or_block,
+    resolve_attempt,
+    start_attempt,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -169,6 +174,31 @@ def _mark_posted(row_id: int, platform_post_id: str) -> None:
         )
 
 
+def _requeue_clip(row_id: int) -> None:
+    """Revert clips_ready.status from 'posting' back to 'queued' so the
+    next publisher cycle re-picks the clip.
+
+    Codex 2026-05-18 P1#2: prior code left a quota-blocked clip stuck
+    in 'posting' (because `_pick_next_clip()` only selects WHERE
+    status='queued'). The row was effectively a black hole. This
+    helper closes that loop. The structured event log records the
+    deferral reason; the DB only needs the state revert.
+
+    Note: clips_ready has a UNIQUE partial index on (clip_id,
+    target_platform) WHERE status IN ('queued','posting',...), so
+    flipping back to 'queued' doesn't break that constraint —
+    the row stays in the active set, just under a different status."""
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE clips_ready
+               SET status = 'queued'
+             WHERE id = ? AND status = 'posting'
+            """,
+            (row_id,),
+        )
+
+
 def _mark_failed(row_id: int, reason: str) -> None:
     with connect() as conn:
         conn.execute(
@@ -246,11 +276,23 @@ async def run_publisher() -> None:
     schedule = load("posting_schedule")
     platforms_cfg = schedule.get("platforms") or {}
 
+    # Codex 2026-05-18 P1#2 follow-up: _requeue_clip flips status back to
+    # 'queued', so without this guard the same row gets re-picked on the
+    # next iteration and the loop spins forever. Track row ids we've
+    # already deferred this cycle and exit when one comes back around.
+    deferred: set[int] = set()
+
     while True:
         clip = _pick_next_clip()
         if clip is None:
             log(agent="publisher", event_type="queue_empty",
                 rationale="no clips due to post (or none have a passing latest compliance result)")
+            return
+        if clip["id"] in deferred:
+            # Came back to a row we already deferred → nothing else is
+            # claimable this cycle. Revert and exit so the next scheduler
+            # tick re-tries fresh.
+            _requeue_clip(clip["id"])
             return
 
         platform = clip["target_platform"]
@@ -334,17 +376,19 @@ async def run_publisher() -> None:
                 platform, clip["account_id"], clip_id=clip_id,
             )
         except QuotaExceeded:
-            # Don't mark_failed — that'd remove the clip from the queue.
-            # Leaving status='queued' means the next publisher cycle (or
-            # tomorrow's run after the rolling 24h window opens) picks
-            # it up again.
+            # Codex 2026-05-18 P1#2: _pick_next_clip flipped status to
+            # 'posting'; we MUST revert to 'queued' or the clip is lost
+            # to the next cycle. _mark_failed would remove it entirely.
+            _requeue_clip(clip["id"])
+            deferred.add(clip["id"])
             continue
 
-        # Record the attempt BEFORE the upload call. A crash mid-upload
-        # still consumed quota platform-side; the local ledger must
-        # reflect that or we'll over-publish.
-        record_attempt(platform, clip["account_id"],
-                       clip_id=clip_id, status="attempted")
+        # Codex 2026-05-18 P1#3: start_attempt inserts ONE 'attempted'
+        # row and returns its id. resolve_attempt UPDATEs that same row
+        # in place — one upload = one quota row, regardless of outcome.
+        attempt_id = start_attempt(
+            platform, clip["account_id"], clip_id=clip_id,
+        )
 
         try:
             platform_post_id = await dispatch(
@@ -355,25 +399,23 @@ async def run_publisher() -> None:
                 account_id=clip["account_id"],
             )
         except NotImplementedError:
-            record_attempt(platform, clip["account_id"],
-                           clip_id=clip_id, status="failed")
+            resolve_attempt(attempt_id, status="failed")
             _mark_failed(clip["id"], "phase1_scaffold:live_upload_not_wired")
             log(agent="publisher", event_type="phase1_scaffold",
                 clip_id=clip_id, payload={"platform": platform},
                 rationale="upload call stubbed in Phase 1; row marked failed for retry")
             continue
         except Exception as exc:  # pragma: no cover — defensive only
-            record_attempt(platform, clip["account_id"],
-                           clip_id=clip_id, status="failed")
+            resolve_attempt(attempt_id, status="failed")
             _mark_failed(clip["id"], f"upload_error:{exc!r}")
             log(agent="publisher", event_type="post_failed", level="error",
                 clip_id=clip_id, payload={"platform": platform, "error": repr(exc)},
                 rationale="upload raised")
             continue
 
-        record_attempt(platform, clip["account_id"],
-                       clip_id=clip_id, status="succeeded",
-                       platform_post_id=platform_post_id)
+        resolve_attempt(
+            attempt_id, status="succeeded", platform_post_id=platform_post_id,
+        )
         _mark_posted(clip["id"], platform_post_id)
         log(agent="publisher", event_type="post_published",
             clip_id=clip_id,
