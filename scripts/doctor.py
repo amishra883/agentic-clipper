@@ -455,6 +455,38 @@ def check_account_warming() -> list[CheckResult]:
     return out
 
 
+def check_atlas_cloud_credentials() -> list[CheckResult]:
+    """Confirm ATLAS_CLOUD_API_KEY is set somewhere the pipeline can find
+    it. Doesn't ping the API — that's check_live_apis's job — just
+    verifies the key exists so Visuals doesn't silently drop to scaffold
+    mode mid-pilot."""
+    key = os.environ.get("ATLAS_CLOUD_API_KEY")
+    if key:
+        return [CheckResult(
+            name="atlas_cloud: api key", ok=True,
+            detail=f"present in env ({len(key)} chars)",
+        )]
+    env_path = REPO_ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("ATLAS_CLOUD_API_KEY=") and not stripped.startswith("#"):
+                value = stripped.split("=", 1)[1].strip()
+                if value:
+                    return [CheckResult(
+                        name="atlas_cloud: api key", ok=True,
+                        detail=f"present in .env ({len(value)} chars)",
+                    )]
+    return [CheckResult(
+        name="atlas_cloud: api key", ok=False,
+        detail=(
+            "ATLAS_CLOUD_API_KEY not set. Visuals stays in scaffold mode "
+            "→ every clip fails Compliance (no AI-content to disclose). "
+            "See docs/runbook.md §4."
+        ),
+    )]
+
+
 def check_pipeline_dependencies() -> list[CheckResult]:
     """Verify the local tools the orchestrator needs are on PATH /
     importable. Each missing piece downgrades the relevant stage to
@@ -517,6 +549,7 @@ CHECKS = [
     check_strike_monitor,
     check_account_warming,
     check_pipeline_dependencies,
+    check_atlas_cloud_credentials,
     check_live_apis,
 ]
 

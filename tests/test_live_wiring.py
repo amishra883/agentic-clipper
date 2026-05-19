@@ -34,7 +34,8 @@ import pytest
 from agents import editor as editor_mod
 from agents import voice as voice_mod
 from agents import compositor as compositor_mod
-from agents.retry import RetryGiveUp, TransientError
+from agents import visuals as visuals_mod
+from agents.retry import TransientError
 
 
 # ----------------------------------------------------------------------
@@ -436,3 +437,292 @@ def test_ass_timestamp_format():
     assert compositor_mod._ass_timestamp(3661.0) == "1:01:01.00"
     # Negative inputs clamp to 0.
     assert compositor_mod._ass_timestamp(-5.0) == "0:00:00.00"
+
+
+# ----------------------------------------------------------------------
+# Visuals._atlas_cloud_generate (Atlas Cloud HTTP)
+# ----------------------------------------------------------------------
+
+def test_atlas_api_key_missing_raises_not_implemented(monkeypatch, tmp_path):
+    """No env var, no .env → NotImplementedError so the orchestrator
+    drops to scaffold mode."""
+    monkeypatch.delenv("ATLAS_CLOUD_API_KEY", raising=False)
+    monkeypatch.setattr(visuals_mod, "REPO_ROOT", tmp_path)  # no .env there
+    with pytest.raises(NotImplementedError, match="ATLAS_CLOUD_API_KEY"):
+        visuals_mod._atlas_api_key()
+
+
+def test_atlas_api_key_reads_env_first(monkeypatch):
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-from-env")
+    assert visuals_mod._atlas_api_key() == "sk-from-env"
+
+
+def test_atlas_api_key_falls_back_to_dotenv(monkeypatch, tmp_path):
+    monkeypatch.delenv("ATLAS_CLOUD_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "# header comment\nATLAS_CLOUD_API_KEY=sk-from-dotenv\n"
+    )
+    monkeypatch.setattr(visuals_mod, "REPO_ROOT", tmp_path)
+    assert visuals_mod._atlas_api_key() == "sk-from-dotenv"
+
+
+def test_seedance_model_slug_text_to_video():
+    assert visuals_mod._seedance_model_slug("fast", has_reference=False) == \
+        "bytedance/seedance-2.0-fast/text-to-video"
+    assert visuals_mod._seedance_model_slug("pro", has_reference=True) == \
+        "bytedance/seedance-2.0-pro/reference-to-video"
+
+
+def test_atlas_cloud_generate_happy_path(monkeypatch):
+    """Successful submit + one poll returning 'succeeded' → returns the
+    full payload for parse_atlas_response to classify."""
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+
+    calls = []
+
+    def fake_request(method, url, *, api_key, body=None, timeout=30):
+        calls.append((method, url))
+        if method == "POST":
+            return 200, b'{"task_id": "tsk_abc"}'
+        # GET /tasks/tsk_abc
+        return 200, (
+            b'{"task_id": "tsk_abc", "status": "succeeded",'
+            b' "output": {"video_url": "https://cdn.example/out.mp4"},'
+            b' "usage": {"amount_usd": 0.132, "billed_seconds": 6}}'
+        )
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    payload = asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+        "test prompt", duration_s=6, tier="fast", seed=None,
+        reference_image_path=None,
+    ))
+    assert payload["status"] == "succeeded"
+    assert payload["output"]["video_url"] == "https://cdn.example/out.mp4"
+    # POST first, then GET.
+    assert calls[0][0] == "POST"
+    assert "text-to-video" in calls[0][1]
+    assert calls[1][0] == "GET"
+    assert "/tasks/tsk_abc" in calls[1][1]
+
+
+def test_atlas_cloud_generate_429_raises_transient(monkeypatch):
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+
+    def fake_request(method, url, **kw):
+        return 429, b"rate limited"
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    with pytest.raises(TransientError, match="rate-limited"):
+        asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+            "p", duration_s=4, tier="fast", seed=None,
+            reference_image_path=None,
+        ))
+
+
+def test_atlas_cloud_generate_5xx_raises_transient(monkeypatch):
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+
+    def fake_request(method, url, **kw):
+        return 503, b"upstream"
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    with pytest.raises(TransientError, match="503"):
+        asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+            "p", duration_s=4, tier="fast", seed=None,
+            reference_image_path=None,
+        ))
+
+
+def test_atlas_cloud_generate_4xx_raises_permanent(monkeypatch):
+    """A 400 (malformed prompt, etc.) is permanent — no retry."""
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+
+    def fake_request(method, url, **kw):
+        return 400, b'{"error": "prompt too long"}'
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    with pytest.raises(RuntimeError, match="permanent"):
+        asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+            "p", duration_s=4, tier="fast", seed=None,
+            reference_image_path=None,
+        ))
+
+
+def test_atlas_cloud_generate_failed_status_returned_for_classification(monkeypatch):
+    """status=failed from poll → returned payload (parse_atlas_response
+    classifies as error)."""
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+
+    def fake_request(method, url, **kw):
+        if method == "POST":
+            return 200, b'{"task_id": "tsk_x"}'
+        return 200, b'{"status": "failed", "error": "provider error"}'
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    payload = asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+        "p", duration_s=4, tier="fast", seed=None,
+        reference_image_path=None,
+    ))
+    assert payload["status"] == "failed"
+
+
+def test_atlas_cloud_generate_rejects_local_path_reference(monkeypatch):
+    """Atlas's reference_images endpoint takes URLs. A local file path
+    won't work — raise immediately rather than uploading bytes the
+    provider will reject."""
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+
+    def fake_request(*a, **kw):
+        return 200, b'{"task_id": "tsk_x"}'
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    with pytest.raises(RuntimeError, match="HTTPS URL"):
+        asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+            "p", duration_s=4, tier="fast", seed=42,
+            reference_image_path="/local/avatars/manic.png",
+        ))
+
+
+def test_atlas_cloud_generate_accepts_https_reference(monkeypatch):
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+    captured = []
+
+    def fake_request(method, url, *, api_key, body=None, timeout=30):
+        if body is not None:
+            captured.append(body)
+        if method == "POST":
+            return 200, b'{"task_id": "tsk_y"}'
+        return 200, (
+            b'{"status": "succeeded",'
+            b' "output": {"video_url": "https://cdn/out.mp4"},'
+            b' "usage": {"amount_usd": 0.066}}'
+        )
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+        "p", duration_s=4, tier="fast", seed=730421,
+        reference_image_path="https://cdn.example/avatar.png",
+    ))
+    assert captured[0]["reference_images"] == ["https://cdn.example/avatar.png"]
+    assert captured[0]["seed"] == 730421
+
+
+def test_atlas_cloud_generate_clamps_duration_to_valid_range(monkeypatch):
+    """Atlas accepts 4-15s; our shot durations are floats. Round + clamp."""
+    monkeypatch.setenv("ATLAS_CLOUD_API_KEY", "sk-test")
+    captured = []
+
+    def fake_request(method, url, *, api_key, body=None, timeout=30):
+        if body is not None:
+            captured.append(body)
+        if method == "POST":
+            return 200, b'{"task_id": "tsk"}'
+        return 200, (
+            b'{"status": "succeeded", "output": {"video_url": "https://x/o.mp4"},'
+            b' "usage": {"amount_usd": 0.044}}'
+        )
+    monkeypatch.setattr(visuals_mod, "_atlas_request", fake_request)
+
+    # 0.5s → clamped to 4
+    asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+        "p", duration_s=0.5, tier="fast", seed=None, reference_image_path=None,
+    ))
+    assert captured[-1]["duration"] == 4
+    # 25s → clamped to 15
+    asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+        "p", duration_s=25.0, tier="fast", seed=None, reference_image_path=None,
+    ))
+    assert captured[-1]["duration"] == 15
+    # 6.4s → rounded to 6
+    asyncio.run(visuals_mod._atlas_cloud_generate.__wrapped__(
+        "p", duration_s=6.4, tier="fast", seed=None, reference_image_path=None,
+    ))
+    assert captured[-1]["duration"] == 6
+
+
+# ----------------------------------------------------------------------
+# Visuals._download_cdn_to_local
+# ----------------------------------------------------------------------
+
+def test_download_cdn_to_local_writes_bytes_atomically(monkeypatch, tmp_path):
+    """Happy path: urllib returns 200 with bytes; the file lands at
+    dest with no .partial leftover."""
+    import io
+    import urllib.request
+
+    dest = tmp_path / "out.mp4"
+    payload = b"\x00\x00\x00\x18ftypmp4\x00\x00\x00\x00" + b"\x00" * 1024
+
+    class FakeResp:
+        status = 200
+        def read(self, n=None):
+            # shutil.copyfileobj reads in chunks
+            data = payload
+            self._data = getattr(self, "_data", io.BytesIO(data))
+            return self._data.read(n) if n else self._data.read()
+
+    class FakeURLOpen:
+        def __init__(self, data): self.data = data
+        def __enter__(self): return FakeResp()
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: FakeURLOpen(payload),
+    )
+
+    visuals_mod._download_cdn_to_local("https://cdn/out.mp4", dest)
+    assert dest.exists()
+    assert dest.stat().st_size > 0
+    # No .partial leftover
+    leftover = list(tmp_path.glob(".*.partial"))
+    assert leftover == []
+
+
+def test_download_cdn_to_local_non_200_raises(monkeypatch, tmp_path):
+    import urllib.request
+
+    class FakeResp:
+        status = 404
+        def read(self, n=None):
+            return b""
+
+    class FakeURLOpen:
+        def __enter__(self): return FakeResp()
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: FakeURLOpen(),
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        visuals_mod._download_cdn_to_local(
+            "https://cdn/out.mp4", tmp_path / "out.mp4",
+        )
+    # Partial cleaned up.
+    assert list(tmp_path.glob(".*.partial")) == []
+
+
+def test_download_cdn_to_local_zero_bytes_raises_and_cleans_up(monkeypatch, tmp_path):
+    import urllib.request
+
+    class FakeResp:
+        status = 200
+        def read(self, n=None):
+            return b""
+
+    class FakeURLOpen:
+        def __enter__(self): return FakeResp()
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: FakeURLOpen(),
+    )
+
+    with pytest.raises(RuntimeError, match="zero bytes"):
+        visuals_mod._download_cdn_to_local(
+            "https://cdn/out.mp4", tmp_path / "out.mp4",
+        )
+    assert list(tmp_path.glob(".*.partial")) == []

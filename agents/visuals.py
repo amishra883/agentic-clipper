@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -246,12 +247,112 @@ def _localize_asset_path(*, prompt_hash: str, cdn_url: str | None) -> str:
     bytes to this local path with SHA verification, and falls back to
     keeping the CDN URL only if the local write fails (then quarantine).
     """
-    _ = cdn_url  # CDN URL is audited via raw_response_json; not used in the
-                 # path itself so cache lookups don't depend on URL freshness.
+    _ = cdn_url  # CDN URL is audited via raw_response_json; the local
+                 # path is deterministic by prompt_hash so cache lookups
+                 # don't depend on URL freshness. Actual byte fetch lives
+                 # in _download_cdn_to_local() and is called from
+                 # run_visuals after parse_atlas_response confirms a URL.
     return str(CACHE_DIR / f"{prompt_hash}.mp4")
 
 
-# ---------- Provider stubs ----------
+def _download_cdn_to_local(url: str, dest: Path) -> None:
+    """Stream a Seedance CDN URL to disk. Writes to a sibling `.partial`
+    file then atomically renames so a half-download never poisons the
+    cache. Raises on network failure, HTTP non-200, or write failure —
+    caller decides whether to quarantine.
+
+    No SHA verification yet: Atlas's response doesn't ship a content
+    hash. The ffprobe duration check in Compositor catches truncated
+    downloads at the next stage."""
+    import shutil
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.parent / f".{dest.name}.partial"
+    req = urllib.request.Request(url, headers={"User-Agent": _ATLAS_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"cdn download HTTP {resp.status} for {url}"
+                )
+            with open(partial, "wb") as fh:
+                shutil.copyfileobj(resp, fh, length=1024 * 64)
+    except Exception:
+        # Clean up the partial on any failure path.
+        try:
+            partial.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    if partial.stat().st_size == 0:
+        partial.unlink()
+        raise RuntimeError(f"cdn download wrote zero bytes for {url}")
+    os.replace(partial, dest)
+
+
+# ---------- Atlas Cloud HTTP wiring ----------
+
+# Docs/seedance_access.md:60 documents the v1 endpoint. We hit the model
+# slug + the seedance-2.0-{fast|pro} text-to-video / reference-to-video
+# variant depending on whether we have a reference image (the avatar).
+_ATLAS_BASE = os.environ.get("ATLAS_CLOUD_BASE", "https://api.atlascloud.ai/v1")
+# Cloudflare blocks urllib's default UA; match the avatar script.
+_ATLAS_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+_ATLAS_POLL_INTERVAL_S = 2.0
+_ATLAS_POLL_TIMEOUT_S = 240
+
+
+def _atlas_api_key() -> str:
+    """Read ATLAS_CLOUD_API_KEY from env, then `.env`. Raises
+    NotImplementedError if absent so the orchestrator drops to scaffold
+    mode — same contract as missing binaries elsewhere."""
+    key = os.environ.get("ATLAS_CLOUD_API_KEY")
+    if key:
+        return key
+    env_path = REPO_ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("ATLAS_CLOUD_API_KEY=") and not line.startswith("#"):
+                return line.split("=", 1)[1].strip()
+    raise NotImplementedError(
+        "ATLAS_CLOUD_API_KEY not set; "
+        "see docs/runbook.md §4 (Atlas Cloud signup + funding)"
+    )
+
+
+def _atlas_request(
+    method: str, url: str, *, api_key: str,
+    body: dict | None = None, timeout: int = 30,
+) -> tuple[int, bytes]:
+    """stdlib-only HTTP. Returns (status, raw_body). Network failures
+    (DNS / connection reset / read timeout) raise OSError so the caller
+    decides whether to map to TransientError. HTTPError instances are
+    captured and returned with their status + body so we can classify
+    4xx vs 5xx without an extra except."""
+    import urllib.error
+    import urllib.request
+    headers = {"Content-Type": "application/json", "User-Agent": _ATLAS_USER_AGENT,
+               "Authorization": f"Bearer {api_key}"}
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read() or b""
+
+
+def _seedance_model_slug(tier: Tier, has_reference: bool) -> str:
+    """Build the model slug per docs/seedance_access.md:60. The endpoint
+    is `/models/bytedance/seedance-2.0-{tier}/{variant}` where variant
+    is `text-to-video` (no reference) or `reference-to-video` (with one)."""
+    variant = "reference-to-video" if has_reference else "text-to-video"
+    return f"bytedance/seedance-2.0-{tier}/{variant}"
 
 
 @retry_external(max_attempts=3, base_delay_s=2.0)
@@ -263,15 +364,160 @@ async def _atlas_cloud_generate(
     seed: int | None,
     reference_image_path: str | None,
 ) -> dict:
-    """Atlas Cloud Seedance 2.0 endpoint. Wrapped in retry_external so
-    rate-limit / network errors back off + retry.
+    """Atlas Cloud Seedance 2.0 video generation. POSTs the task,
+    polls until terminal, returns the full response payload.
 
-    Phase 2 wires the actual POST. Transient errors (HTTP 429, 5xx,
-    network) raise TransientError so retry_external honors them.
-    Permanent errors (400, malformed response) propagate to the caller
-    who quarantines.
+    Per docs/seedance_access.md the contract is async — POST returns a
+    task_id immediately and we poll `/v1/tasks/{task_id}` until status
+    is `succeeded` or `failed`.
+
+    Mapping to TransientError so retry_external retries:
+      - HTTP 429 (rate limit) — provider's Retry-After honored implicitly
+        via our exponential backoff
+      - HTTP 5xx (upstream)
+      - Network errors (DNS, connection reset)
+      - Poll timeout (task still processing past _ATLAS_POLL_TIMEOUT_S)
+
+    Permanent errors that propagate as RuntimeError (caller quarantines):
+      - HTTP 4xx other than 429 (malformed prompt, missing seed, etc.)
+      - `status=failed` from the poll endpoint
+      - Missing api key → NotImplementedError so the caller drops to
+        scaffold mode instead of looping forever
     """
-    raise NotImplementedError("live mode not implemented in Phase 1 scaffold")
+    import asyncio
+    import urllib.error
+
+    api_key = _atlas_api_key()
+    model_slug = _seedance_model_slug(tier, has_reference=bool(reference_image_path))
+    submit_url = f"{_ATLAS_BASE}/models/{model_slug}"
+
+    # Duration must be an integer 4-15 per the documented contract; clamp
+    # the input so a stray 0.5s shot doesn't trip a 400.
+    duration_int = max(4, min(15, int(round(duration_s))))
+
+    body: dict[str, Any] = {
+        "prompt": prompt,
+        "duration": duration_int,
+        "resolution": "720p",
+        "aspect_ratio": "9:16",   # short-form vertical
+    }
+    if seed is not None:
+        body["seed"] = int(seed)
+    if reference_image_path:
+        # The contract takes URLs for reference_images. The avatar is on
+        # local disk; Atlas's reference-to-video endpoint won't reach it.
+        # Operator wires an asset URL (CDN / S3) for the locked avatar
+        # before the first live run; the orchestrator passes the file
+        # path through, and this function refuses with a clear error.
+        if reference_image_path.startswith(("http://", "https://")):
+            body["reference_images"] = [reference_image_path]
+        else:
+            raise RuntimeError(
+                f"atlas_cloud: reference_images must be HTTPS URLs, "
+                f"got local path {reference_image_path!r}. Upload the "
+                "avatar reference to a CDN and configure the URL in "
+                "config/avatars/README.md."
+            )
+
+    # ---- POST: submit ----
+    try:
+        status, raw = await asyncio.to_thread(
+            _atlas_request, "POST", submit_url,
+            api_key=api_key, body=body, timeout=30,
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        raise TransientError(f"atlas_cloud network error on submit: {exc}") from exc
+
+    if status == 429:
+        raise TransientError(f"atlas_cloud rate-limited on submit: {raw[:200]!r}")
+    if status >= 500:
+        raise TransientError(
+            f"atlas_cloud HTTP {status} on submit: {raw.decode('utf-8', 'replace')[:200]}"
+        )
+    if status >= 400:
+        raise RuntimeError(
+            f"atlas_cloud HTTP {status} on submit (permanent): "
+            f"{raw.decode('utf-8', 'replace')[:300]}"
+        )
+    try:
+        submit_payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"atlas_cloud submit returned non-JSON: {raw[:200]!r}"
+        ) from exc
+
+    # The docs show `task_id` at the top level; some Atlas variants nest
+    # it under `data`. Read both for portability.
+    data_block = submit_payload.get("data") or submit_payload
+    task_id = (
+        data_block.get("task_id")
+        or data_block.get("id")
+        or submit_payload.get("task_id")
+        or submit_payload.get("id")
+    )
+    if not task_id:
+        raise RuntimeError(
+            f"atlas_cloud submit OK but no task_id in response: "
+            f"{json.dumps(submit_payload)[:300]}"
+        )
+
+    # ---- Poll: GET /v1/tasks/{task_id} ----
+    poll_url = f"{_ATLAS_BASE}/tasks/{task_id}"
+    deadline = asyncio.get_event_loop().time() + _ATLAS_POLL_TIMEOUT_S
+    last_payload: dict[str, Any] | None = None
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            status, raw = await asyncio.to_thread(
+                _atlas_request, "GET", poll_url,
+                api_key=api_key, timeout=15,
+            )
+        except (urllib.error.URLError, OSError) as exc:
+            # Transient mid-poll — let retry_external loop the whole call
+            # rather than spinning on the same task.
+            raise TransientError(f"atlas_cloud poll network error: {exc}") from exc
+
+        if status == 429:
+            raise TransientError(f"atlas_cloud rate-limited on poll: {raw[:200]!r}")
+        if status >= 500:
+            raise TransientError(
+                f"atlas_cloud HTTP {status} on poll: {raw.decode('utf-8', 'replace')[:200]}"
+            )
+        if status >= 400:
+            raise RuntimeError(
+                f"atlas_cloud HTTP {status} on poll (permanent): "
+                f"{raw.decode('utf-8', 'replace')[:300]}"
+            )
+        try:
+            last_payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"atlas_cloud poll returned non-JSON: {raw[:200]!r}"
+            ) from exc
+
+        data = last_payload.get("data") or last_payload
+        state = (
+            data.get("status")
+            or data.get("state")
+            or data.get("job_status")
+        )
+        if state == "succeeded":
+            # Return the full payload — parse_atlas_response classifies
+            # it (succeeded vs face_filter vs error) from here.
+            return last_payload
+        if state == "failed":
+            # Permanent failure on the provider side. parse_atlas_response
+            # will map this to AtlasResponse(status="error").
+            return last_payload
+        # "submitted" / "processing" / "queued" — keep polling.
+        await asyncio.sleep(_ATLAS_POLL_INTERVAL_S)
+
+    # Timed out waiting. retry_external will retry the whole submit
+    # rather than continue polling — that's intentional: a stuck task
+    # is fundamentally indistinguishable from a lost task at our layer.
+    raise TransientError(
+        f"atlas_cloud poll timeout after {_ATLAS_POLL_TIMEOUT_S}s; "
+        f"last_status={(last_payload or {}).get('status')!r}"
+    )
 
 
 @retry_external(max_attempts=2, base_delay_s=2.0)
@@ -842,6 +1088,27 @@ async def run_visuals(clip_id: str, shot_list: list[ShotListEntry]) -> list[Gene
                     prompt_hash=prompt_hash,
                     cdn_url=parsed.video_url,
                 )
+
+                # Fetch the bytes to the deterministic local path. CDN
+                # URLs expire (7d signed URLs are typical) so we localize
+                # eagerly. A download failure logs + quarantines — the
+                # Compositor would otherwise hit FileNotFoundError when
+                # it reads the asset_path back from the cache.
+                if parsed.video_url and not Path(local_path).exists():
+                    try:
+                        _download_cdn_to_local(parsed.video_url, Path(local_path))
+                    except Exception as exc:
+                        log(agent="visuals", event_type="asset_download_failed",
+                            level="blocked", clip_id=clip_id,
+                            payload={"prompt_hash": prompt_hash,
+                                     "cdn_url": parsed.video_url,
+                                     "error": repr(exc)[:200]},
+                            rationale="CDN download failed; clip routed to quarantine")
+                        _quarantine_clip(
+                            clip_id,
+                            f"cdn download failed for {shot.shot_type}: {exc}",
+                        )
+                        return assets
 
                 asset = GeneratedAsset(
                     path=local_path,

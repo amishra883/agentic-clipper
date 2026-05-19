@@ -54,6 +54,22 @@ def tmp_quarantine(monkeypatch, tmp_path):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def stub_cdn_download(monkeypatch):
+    """Stub the live CDN→disk download so tests that mock
+    `_atlas_cloud_generate` with a synthetic CDN URL don't try to make
+    real network calls. Each test gets a no-op that writes a 64-byte
+    placeholder to the destination, matching the live function's
+    contract (target file exists, non-zero size). The real download is
+    exercised in tests/test_live_wiring.py with mocked urllib."""
+    def _fake(url: str, dest):
+        from pathlib import Path as _Path
+        p = _Path(dest)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(visuals, "_download_cdn_to_local", _fake)
+
+
 def _budget_cfg() -> dict:
     return {
         "line_items": {
