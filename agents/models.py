@@ -41,6 +41,12 @@ class TranscriptSegment:
     end_s: float
     text: str
     words: list[dict] = field(default_factory=list)  # word-level for caption burn-in
+    # faster-whisper exposes per-segment no_speech_prob (0..1) — the model's
+    # estimate that the segment is non-speech. Editor's no-speech quarantine
+    # (E-15) checks whether every segment exceeds NO_SPEECH_THRESHOLD; if so,
+    # the source is audio-only / instrumental / unintelligible and the clip
+    # is shunted to /quarantine/ rather than wasting downstream paid calls.
+    no_speech_prob: float | None = None
 
 
 @dataclass
