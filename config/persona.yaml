@@ -31,6 +31,7 @@ personas:
       # from "voice clone of a real person".
       approved_voice_ids:
         - manic_reactor_coqui_default_v1     # Phase 1 default — locally-trained Coqui XTTS-v2 voice
+        - manic_reactor_piper_amy_v1          # Py 3.12+ fallback — Piper en_US-amy-medium (no voice cloning)
         - phase1_scaffold_voice               # Phase 1 placeholder; remove before any live run
 
     energy_floor:

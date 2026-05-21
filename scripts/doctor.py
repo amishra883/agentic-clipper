@@ -523,15 +523,50 @@ def check_pipeline_dependencies() -> list[CheckResult]:
 
     for pkg, hint in (
         ("faster_whisper", "pip install faster-whisper"),
-        ("TTS", "pip install TTS  # Coqui XTTS-v2 — installs ~2GB of models on first run"),
+        ("piper", "pip install piper-tts  # Py 3.14-compatible local TTS"),
+        ("TTS", "pip install TTS  # Coqui XTTS-v2 — requires Python <3.12"),
     ):
         if importlib.util.find_spec(pkg) is not None:
             out.append(CheckResult(name=f"python: {pkg}", ok=True, detail="importable"))
         else:
+            # TTS is documented as Python-<3.12-only; downgrade to a softer
+            # hint rather than a hard FAIL on 3.12+ environments where the
+            # operator chose Piper. Voice has a fallback chain (Coqui →
+            # Piper → scaffold) so missing one engine isn't blocking.
+            soft = pkg == "TTS" and sys.version_info >= (3, 12)
             out.append(CheckResult(
-                name=f"python: {pkg}", ok=False,
-                detail=f"not installed; {hint}. Stage falls back to scaffold mode.",
+                name=f"python: {pkg}",
+                ok=soft,  # OK if it's the documented-incompatible engine
+                detail=(
+                    f"not installed (expected on Python {sys.version_info[0]}."
+                    f"{sys.version_info[1]} — fall back to Piper)"
+                    if soft
+                    else f"not installed; {hint}. Stage falls back to scaffold mode."
+                ),
             ))
+
+    # Piper voice model file. Piper's CLI ships with the runtime but voice
+    # models are downloaded separately. Without a model file, _synthesize_piper
+    # raises NotImplementedError and the orchestrator drops to scaffold mode.
+    piper_voice_path = (
+        REPO_ROOT / "config" / "voice_models" / "piper" / "en_US-amy-medium.onnx"
+    )
+    if piper_voice_path.exists():
+        out.append(CheckResult(
+            name="piper: voice model", ok=True,
+            detail=f"present at {piper_voice_path}",
+        ))
+    else:
+        out.append(CheckResult(
+            name="piper: voice model", ok=False,
+            detail=(
+                f"missing at {piper_voice_path}. Download with: "
+                f"mkdir -p config/voice_models/piper && "
+                f"cd config/voice_models/piper && "
+                f"curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx && "
+                f"curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
+            ),
+        ))
     return out
 
 

@@ -174,6 +174,82 @@ def test_synthesize_coqui_writes_wav_and_returns_runtime(monkeypatch, tmp_path):
     assert runtime == pytest.approx(1.0, rel=0.01)
 
 
+def test_synthesize_piper_missing_voice_raises_not_implemented(monkeypatch, tmp_path):
+    """Either piper-tts missing OR no voice model file → NotImplementedError
+    so caller falls through to scaffold mode."""
+    monkeypatch.setattr(voice_mod, "_get_piper_voice", lambda: None)
+    with pytest.raises(NotImplementedError, match="piper-tts"):
+        asyncio.run(voice_mod._synthesize_piper(
+            "hello", {"voice": {"language": "en"}}, tmp_path / "out.wav",
+        ))
+
+
+def test_synthesize_piper_writes_wav_and_returns_runtime(monkeypatch, tmp_path):
+    """Mocked PiperVoice writes a real WAV header so the stdlib reader
+    can compute a runtime."""
+    import wave
+
+    out = tmp_path / "out.wav"
+
+    def fake_synthesize_wav(text, wav_file, set_wav_format=True):
+        # PiperVoice.synthesize_wav writes header + frames to the wave
+        # file the caller opened. Simulate by writing 2 seconds of audio.
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(22050)
+        wav_file.writeframes(b"\x00\x00" * 22050 * 2)
+
+    fake_voice = MagicMock()
+    fake_voice.synthesize_wav = fake_synthesize_wav
+    monkeypatch.setattr(voice_mod, "_get_piper_voice", lambda: fake_voice)
+
+    runtime = asyncio.run(voice_mod._synthesize_piper(
+        "hello world", {"voice": {"language": "en"}}, out,
+    ))
+    assert out.exists()
+    assert runtime == pytest.approx(2.0, rel=0.01)
+
+
+def test_synthesize_piper_empty_output_raises_transient(monkeypatch, tmp_path):
+    """Empty-file output (race / IO glitch) → TransientError so retry
+    loop retries."""
+    out = tmp_path / "out.wav"
+
+    def fake_synthesize_wav(text, wav_file, set_wav_format=True):
+        # Don't write any frames — wave still writes a header so the
+        # file isn't truly empty. Force zero bytes after closing.
+        pass
+
+    fake_voice = MagicMock()
+    fake_voice.synthesize_wav = fake_synthesize_wav
+    monkeypatch.setattr(voice_mod, "_get_piper_voice", lambda: fake_voice)
+
+    # Wave header alone is ~44 bytes, so we need to force a zero-byte
+    # path. Use a different approach: have the fake unlink + recreate empty.
+    def fake_synthesize_wav_then_zero(text, wav_file, set_wav_format=True):
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(22050)
+        # No writeframes call — wave still writes the header.
+    fake_voice.synthesize_wav = fake_synthesize_wav_then_zero
+
+    # Patch wave.open to write 0 bytes after the synthesis no-op.
+    # Simpler: post-process the file to zero bytes via a sneaky wrapper.
+    original_to_thread = voice_mod.asyncio.to_thread if hasattr(voice_mod, "asyncio") else None
+
+    async def fake_to_thread_then_truncate(fn, *args, **kw):
+        fn(*args, **kw)
+        # After the synthesis, truncate to zero bytes to simulate the failure.
+        out.write_bytes(b"")
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "to_thread", fake_to_thread_then_truncate)
+    with pytest.raises(TransientError, match="empty"):
+        asyncio.run(voice_mod._synthesize_piper(
+            "hello", {"voice": {"language": "en"}}, out,
+        ))
+
+
 def test_synthesize_coqui_empty_output_raises_transient(monkeypatch, tmp_path):
     """An empty file is a TransientError so retry_external retries —
     sometimes Coqui races on first model load."""

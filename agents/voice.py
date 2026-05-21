@@ -259,6 +259,98 @@ async def _synthesize_coqui(text: str, persona: dict, dest_path: Path) -> float:
     return runtime_s
 
 
+_piper_voice = None
+
+
+def _get_piper_voice():
+    """Lazy-initialize the Piper TTS voice. Returns None if the piper-tts
+    package isn't installed OR the voice model file isn't on disk —
+    caller falls back to NotImplementedError so the orchestrator's
+    scaffold path stays open.
+
+    The voice model is a small .onnx file (~60MB) that the operator
+    downloads once. Path is read from
+    config/voice_models.yaml under `piper.model_path`. Default model:
+    en_US-amy-medium (warm female voice, decent expressiveness — good
+    placeholder for manic_reactor until Coqui voice cloning comes back).
+    """
+    global _piper_voice
+    if _piper_voice is not None:
+        return _piper_voice
+    try:
+        from piper import PiperVoice
+    except ImportError:
+        return None
+    cfg = _voice_models_config()
+    piper_cfg = cfg.get("piper") or {}
+    model_path_str = piper_cfg.get("model_path")
+    if not model_path_str:
+        # Default: voice model lives at config/voice_models/piper/en_US-amy-medium.onnx
+        # Operator downloads it via the doctor's hint, or piper-tts CLI.
+        model_path_str = str(REPO_ROOT / "config" / "voice_models" / "piper" / "en_US-amy-medium.onnx")
+    model_path = Path(model_path_str).expanduser()
+    if not model_path.exists():
+        return None
+    _piper_voice = PiperVoice.load(str(model_path))
+    return _piper_voice
+
+
+async def _synthesize_piper(text: str, persona: dict, dest_path: Path) -> float:
+    """Local Piper TTS. Writes a WAV to ``dest_path``, returns runtime
+    in seconds.
+
+    Piper is the Python-3.14-compatible drop-in for Coqui XTTS-v2.
+    Trade-off: Piper picks from a library of pre-trained voices (no
+    zero-shot cloning), so the "manic_reactor" persona ships with a
+    fixed Piper voice (en_US-amy-medium by default; override via
+    config/voice_models.yaml `piper.model_path`).
+
+    Raises ``NotImplementedError`` when piper-tts isn't installed OR
+    the voice model file isn't on disk — caller's fallback path stays
+    open. Other failures raise ``TransientError`` so ``retry_external``
+    retries.
+    """
+    voice = _get_piper_voice()
+    if voice is None:
+        raise NotImplementedError(
+            "piper-tts not available; install with `pip install piper-tts` "
+            "and download a voice model (see docs/runbook.md §7.4)"
+        )
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = persona  # Piper voice is fixed per model file; persona-driven
+                 # voice selection comes via voice_models.yaml mapping,
+                 # not per-call.
+
+    import asyncio
+    import wave
+
+    def _do_synthesis() -> None:
+        # PiperVoice.synthesize_wav writes to an open wave.Wave_write.
+        # set_wav_format=True writes the WAV header from the voice's
+        # sample rate; we don't have to compute it ourselves.
+        with wave.open(str(dest_path), "wb") as wf:
+            voice.synthesize_wav(text, wf, set_wav_format=True)
+
+    try:
+        await asyncio.to_thread(_do_synthesis)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"piper synth: missing input: {exc}") from exc
+    except OSError as exc:
+        raise TransientError(f"piper synth IO error: {exc}") from exc
+
+    if not dest_path.exists() or dest_path.stat().st_size == 0:
+        raise TransientError(f"piper synth produced empty file at {dest_path}")
+
+    try:
+        with wave.open(str(dest_path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            runtime_s = frames / float(rate) if rate else 0.0
+    except wave.Error:
+        runtime_s = 0.0
+    return runtime_s
+
+
 @retry_external(max_attempts=3, base_delay_s=2.0)
 async def _synthesize_elevenlabs(
     text: str, persona: dict, dest_path: Path,
@@ -328,6 +420,13 @@ def _pick_voice_id(persona: dict, engine: str) -> str:
         # Prefer entries that look like elevenlabs IDs; fall back to the first.
         for v in approved:
             if "elevenlabs" in v.lower() or "_eleven" in v.lower():
+                return v
+    if engine == "piper":
+        # Prefer entries that look like piper IDs; otherwise reuse the
+        # Coqui slot (Piper produces a similar voice character per
+        # persona; Compliance just needs the id in the whitelist).
+        for v in approved:
+            if "piper" in v.lower():
                 return v
     return approved[0]
 
@@ -638,13 +737,36 @@ async def run_voice(clip_id: str, script: Script) -> AudioTrack:
                         script.text, persona, dest_path,
                     )
                 except NotImplementedError:
-                    log(
-                        agent="voice",
-                        event_type="phase1_scaffold",
-                        clip_id=clip_id,
-                        payload={"engine": actual_engine},
-                        rationale="Coqui stubbed in Phase 1; placeholder AudioTrack",
-                    )
+                    # Coqui XTTS-v2 requires Python <3.12. On modern Python
+                    # (3.12+) we fall through to Piper TTS, which supports
+                    # 3.14 and produces decent-quality voice. The engine
+                    # identifier flips to "piper" so downstream (compliance,
+                    # analytics) can attribute correctly.
+                    try:
+                        runtime_s = await _synthesize_piper(
+                            script.text, persona, dest_path,
+                        )
+                        actual_engine = "piper"
+                        log(
+                            agent="voice",
+                            event_type="piper_fallback",
+                            level="info",
+                            clip_id=clip_id,
+                            payload={"reason": "coqui_unavailable"},
+                            rationale="Coqui not available; using Piper local TTS",
+                        )
+                    except NotImplementedError:
+                        # Both Coqui AND Piper unavailable — scaffold mode.
+                        log(
+                            agent="voice",
+                            event_type="phase1_scaffold",
+                            clip_id=clip_id,
+                            payload={"engine": actual_engine},
+                            rationale=(
+                                "Coqui and Piper both unavailable; "
+                                "placeholder AudioTrack persisted for smoke-test"
+                            ),
+                        )
 
             try:
                 loudness_lufs = await _normalize_loudness(

@@ -41,6 +41,22 @@ from agents.stage_lease import stage_lease
 from scripts.migrate import migrate
 
 
+@pytest.fixture(autouse=True)
+def stub_yt_dlp_and_whisper(monkeypatch):
+    """Force scaffold mode for the live Editor helpers. Once yt-dlp +
+    faster-whisper are installed on the operator's machine, the real
+    implementations actually hit the network / load model weights —
+    tests must not. Each test that wants live behavior can
+    re-monkeypatch these inside its body."""
+    import shutil
+    from agents import editor as _editor
+    # Pretend yt-dlp isn't on PATH so _download_source raises
+    # NotImplementedError (the documented "fall back to scaffold" path).
+    monkeypatch.setattr(_editor.shutil, "which", lambda name: None)
+    # Pretend faster-whisper is uninstalled.
+    monkeypatch.setattr(_editor, "_get_whisper_model", lambda: None)
+
+
 @pytest.fixture
 def editor_db(monkeypatch):
     """Fresh DB through the latest migration."""
