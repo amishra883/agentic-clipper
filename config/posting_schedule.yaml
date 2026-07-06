@@ -17,35 +17,51 @@ timezone: America/New_York   # US Eastern per operator default
 # high rejection for solo operators) and automated TikTok uploads are
 # widely reported as algorithmically suppressed. Re-evaluate at month 3.
 
+# === Cadence (operator directive 2026-07-06) ===
+# FOUR clips produced per day, each cross-posted to all three platforms.
+# Posting is executed by the n8n "clip-poster" rail (automation/n8n/) at
+# production time — YouTube + Instagram post immediately when the producer
+# calls the webhook; TikTok generates a manual-upload email to the operator.
+production_slots:            # producer runs (America/New_York)
+  - "08:00"
+  - "12:00"
+  - "16:00"
+  - "20:00"
+
 platforms:
   tiktok:
     mode: manual
+    manual_delivery: n8n_email   # rail emails download link + caption per clip
     manual_drop_directory: data/clips/output/manual_upload/tiktok
-    posts_per_day: 3
-    times:
-      - "07:00"
-      - "12:00"
-      - "20:00"
+    posts_per_day: 4
+    times:                       # target upload times; operator uploads from email
+      - "08:15"
+      - "12:15"
+      - "16:15"
+      - "20:15"
     weekend_boost:
-      enabled: true
-      posts_per_day: 4
-      extra_time: "23:00"
+      enabled: false             # superseded by flat 4/day directive 2026-07-06
 
   instagram_reels:
-    mode: api
-    posts_per_day: 2
+    mode: api                    # via n8n Facebook Graph API nodes
+    posts_per_day: 4
     times:
-      - "11:00"
-      - "19:00"
+      - "08:00"
+      - "12:00"
+      - "16:00"
+      - "20:00"
 
   youtube_shorts:
-    mode: api
-    posts_per_day: 2
+    mode: api                    # via n8n YouTube upload node
+    posts_per_day: 4
     times:
+      - "08:00"
       - "12:00"
-      - "21:00"
+      - "16:00"
+      - "20:00"
 
-# Total: 7 posts/day weekday, 8 posts/day weekend
+# Total: 4 clips/day → up to 12 platform posts/day.
+# YouTube quota check: 4 uploads × 1600 units = 6400 of 10000 daily units. OK.
 # Each clip reformatted per platform (aspect ratio, caption density, hashtag set)
 # rather than producing separate pipelines.
 

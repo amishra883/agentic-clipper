@@ -15,7 +15,14 @@ personas:
       CLAUDE.md "Commentary style guidelines".
 
     voice:
-      tts_engine_default: coqui_xtts_v2
+      # Operator decision 2026-07-06: commentary voice is the OPERATOR'S OWN
+      # recorded voice, cloned via Higgsfield create_voice. This is consented
+      # first-party voice use (the operator recording themselves), NOT a
+      # creator clone — the do_not rule below and the whitelist chokepoint
+      # still block any source-creator voice. Coqui/Piper remain fallbacks
+      # if Higgsfield is unavailable or credits run out.
+      tts_engine_default: higgsfield_speech      # operator voice clone, ~1 credit/track
+      tts_engine_fallback: coqui_xtts_v2
       tts_engine_escalation: elevenlabs_creator
       escalation_trigger: curator_score>=0.85
       target_loudness_lufs: -14
@@ -30,7 +37,10 @@ personas:
       # only configured chokepoint that distinguishes "neutral AI persona"
       # from "voice clone of a real person".
       approved_voice_ids:
-        - manic_reactor_coqui_default_v1     # Phase 1 default — locally-trained Coqui XTTS-v2 voice
+        - operator_voice_higgsfield_PENDING   # REPLACE with the real Higgsfield voice_id after the
+                                              # operator records their voice via create_voice.
+                                              # Consent basis: operator's own voice, self-recorded.
+        - manic_reactor_coqui_default_v1     # fallback — locally-trained Coqui XTTS-v2 voice
         - manic_reactor_piper_amy_v1          # Py 3.12+ fallback — Piper en_US-amy-medium (no voice cloning)
         - phase1_scaffold_voice               # Phase 1 placeholder; remove before any live run
 
