@@ -1,9 +1,4 @@
-// Clip Poster — Autonomous Publishing Rail (n8n Workflow SDK script)
-//
-// Status: VALIDATED against the n8n MCP builder (19 nodes, valid=true) on
-// 2026-07-06. Deployment was interrupted when the n8n MCP connector dropped
-// mid-call. To deploy: reconnect the n8n connector in Claude and re-run
-// create_workflow_from_code with this file's contents, then publish.
+// Clip Poster - Autonomous Publishing Rail (n8n Workflow SDK script)
 //
 // Contract: the producer (Claude Code session in this repo) POSTs one JSON
 // payload per finished clip to webhook path `clip-poster`. See
@@ -23,7 +18,21 @@ const clipWebhook = trigger({
     },
     position: [-600, 300]
   },
-  output: [{ body: { clip_id: '2026-07-06-0001', video_url: 'https://cdn.example.com/final.mp4', title: 'He did WHAT?! #Shorts', description: 'Reaction commentary. AI-generated visuals.', hashtags: ['#gaming', '#reaction'], platforms: ['youtube', 'instagram', 'tiktok_manual'], ig_user_id: '17841400000000000', yt_category_id: '20', yt_privacy: 'public', operator_email: 'amishra883@gmail.com', compliance_passed: true } }]
+  output: [{
+    body: {
+      clip_id: '2026-07-06-0001',
+      video_url: 'https://cdn.example.com/final.mp4',
+      title: 'He did WHAT? #Shorts',
+      description: 'Reaction commentary. AI-generated visuals.',
+      hashtags: ['#gaming', '#reaction'],
+      platforms: ['youtube', 'instagram', 'tiktok_manual'],
+      ig_user_id: '17841400000000000',
+      yt_category_id: '20',
+      yt_privacy: 'public',
+      operator_email: 'amishra883@gmail.com',
+      compliance_passed: true
+    }
+  }]
 });
 
 const normalize = node({
@@ -42,7 +51,7 @@ const normalize = node({
           { id: 'f-desc', name: 'description', value: expr('{{ $json.body?.description ?? $json.description ?? "" }}'), type: 'string' },
           { id: 'f-hash-text', name: 'hashtags_text', value: expr('{{ ($json.body?.hashtags ?? $json.hashtags ?? []).join(" ") }}'), type: 'string' },
           { id: 'f-yt-tags', name: 'yt_tags', value: expr('{{ ($json.body?.hashtags ?? $json.hashtags ?? []).map(h => h.replace("#", "")).join(",") }}'), type: 'string' },
-          { id: 'f-caption', name: 'full_caption', value: expr("{{ ($json.body?.description ?? $json.description ?? '') + '\\n\\n' + ($json.body?.hashtags ?? $json.hashtags ?? []).join(' ') }}"), type: 'string' },
+          { id: 'f-caption', name: 'full_caption', value: expr('{{ ($json.body?.description ?? $json.description ?? "") + "\\n\\n" + ($json.body?.hashtags ?? $json.hashtags ?? []).join(" ") }}'), type: 'string' },
           { id: 'f-platforms', name: 'platforms', value: expr('{{ $json.body?.platforms ?? $json.platforms ?? [] }}'), type: 'array' },
           { id: 'f-ig-user', name: 'ig_user_id', value: expr('{{ $json.body?.ig_user_id ?? $json.ig_user_id ?? "" }}'), type: 'string' },
           { id: 'f-yt-cat', name: 'yt_category_id', value: expr('{{ $json.body?.yt_category_id ?? $json.yt_category_id ?? "20" }}'), type: 'string' },
@@ -54,7 +63,21 @@ const normalize = node({
     },
     position: [-360, 300]
   },
-  output: [{ clip_id: '2026-07-06-0001', video_url: 'https://cdn.example.com/final.mp4', title: 'He did WHAT?! #Shorts', description: 'Reaction commentary. AI-generated visuals.', hashtags_text: '#gaming #reaction', yt_tags: 'gaming,reaction', full_caption: 'Reaction commentary. AI-generated visuals.\n\n#gaming #reaction', platforms: ['youtube', 'instagram', 'tiktok_manual'], ig_user_id: '17841400000000000', yt_category_id: '20', yt_privacy: 'public', operator_email: 'amishra883@gmail.com', compliance_passed: true }]
+  output: [{
+    clip_id: '2026-07-06-0001',
+    video_url: 'https://cdn.example.com/final.mp4',
+    title: 'He did WHAT? #Shorts',
+    description: 'Reaction commentary. AI-generated visuals.',
+    hashtags_text: '#gaming #reaction',
+    yt_tags: 'gaming,reaction',
+    full_caption: 'Reaction commentary. AI-generated visuals. #gaming #reaction',
+    platforms: ['youtube', 'instagram', 'tiktok_manual'],
+    ig_user_id: '17841400000000000',
+    yt_category_id: '20',
+    yt_privacy: 'public',
+    operator_email: 'amishra883@gmail.com',
+    compliance_passed: true
+  }]
 });
 
 const complianceGate = ifElse({
@@ -88,7 +111,21 @@ const markApproved = node({
     },
     position: [140, 180]
   },
-  output: [{ clip_id: '2026-07-06-0001', video_url: 'https://cdn.example.com/final.mp4', title: 'He did WHAT?! #Shorts', full_caption: 'Reaction commentary.\n\n#gaming #reaction', platforms: ['youtube', 'instagram', 'tiktok_manual'], ig_user_id: '17841400000000000', yt_category_id: '20', yt_privacy: 'public', yt_tags: 'gaming,reaction', description: 'Reaction commentary.', operator_email: 'amishra883@gmail.com', compliance_passed: true, gate_passed_at: '2026-07-06T12:00:00.000Z' }]
+  output: [{
+    clip_id: '2026-07-06-0001',
+    video_url: 'https://cdn.example.com/final.mp4',
+    title: 'He did WHAT? #Shorts',
+    full_caption: 'Reaction commentary. #gaming #reaction',
+    platforms: ['youtube', 'instagram', 'tiktok_manual'],
+    ig_user_id: '17841400000000000',
+    yt_category_id: '20',
+    yt_privacy: 'public',
+    yt_tags: 'gaming,reaction',
+    description: 'Reaction commentary.',
+    operator_email: 'amishra883@gmail.com',
+    compliance_passed: true,
+    gate_passed_at: '2026-07-06T12:00:00.000Z'
+  }]
 });
 
 const emailBlockAlert = node({
@@ -100,8 +137,8 @@ const emailBlockAlert = node({
       resource: 'message',
       operation: 'send',
       toRecipients: expr('{{ $json.operator_email }}'),
-      subject: expr('[agentic-clipper] BLOCKED at posting rail — {{ $json.clip_id }}'),
-      bodyContent: expr('Clip {{ $json.clip_id }} arrived at the n8n posting rail WITHOUT compliance_passed=true and was NOT posted anywhere.<br><br>Video: {{ $json.video_url }}<br>Title: {{ $json.title }}<br><br>This should never happen — the producer must run the Compliance gate before calling this webhook. Investigate before re-queueing.'),
+      subject: expr('[agentic-clipper] BLOCKED at posting rail - {{ $json.clip_id }}'),
+      bodyContent: expr('Clip {{ $json.clip_id }} arrived at the n8n posting rail WITHOUT compliance_passed=true and was NOT posted anywhere.<br><br>Video: {{ $json.video_url }}<br>Title: {{ $json.title }}<br><br>This should never happen. The producer must run the Compliance gate before calling this webhook. Investigate before re-queueing.'),
       additionalFields: { bodyContentType: 'html' }
     },
     credentials: { microsoftOutlookOAuth2Api: { id: '5K3bclggRALuCjcH', name: 'Microsoft Outlook account' } },
@@ -321,8 +358,8 @@ const emailTikTokManual = node({
       resource: 'message',
       operation: 'send',
       toRecipients: expr('{{ $json.operator_email }}'),
-      subject: expr('[agentic-clipper] TikTok upload ready — {{ $json.clip_id }}'),
-      bodyContent: expr('A clip passed Compliance and is ready for manual TikTok upload (~2 min).<br><br><b>Download:</b> <a href="{{ $json.video_url }}">{{ $json.video_url }}</a><br><b>Title:</b> {{ $json.title }}<br><b>Caption to paste:</b><br>{{ $json.full_caption }}<br><br><b>Checklist:</b><br>1. Upload via TikTok app or TikTok Studio Desktop.<br>2. Paste the caption above (hashtags included).<br>3. Toggle ON the "AI-generated content" label — required, every clip has AI visuals/voice.<br>4. Post, then reply DONE with the TikTok post URL for the analytics log.'),
+      subject: expr('[agentic-clipper] TikTok upload ready - {{ $json.clip_id }}'),
+      bodyContent: expr('A clip passed Compliance and is ready for manual TikTok upload (about 2 min).<br><br><b>Download:</b> <a href="{{ $json.video_url }}">{{ $json.video_url }}</a><br><b>Title:</b> {{ $json.title }}<br><b>Caption to paste:</b><br>{{ $json.full_caption }}<br><br><b>Checklist:</b><br>1. Upload via TikTok app or TikTok Studio Desktop.<br>2. Paste the caption above (hashtags included).<br>3. Toggle ON the AI-generated content label - required, every clip has AI visuals/voice.<br>4. Post, then reply DONE with the TikTok post URL for the analytics log.'),
       additionalFields: { bodyContentType: 'html' }
     },
     credentials: { microsoftOutlookOAuth2Api: { id: '5K3bclggRALuCjcH', name: 'Microsoft Outlook account' } },
@@ -331,19 +368,31 @@ const emailTikTokManual = node({
   output: [{ success: true }]
 });
 
-const contractNote = sticky(
-  '## Clip Poster — payload contract\n\nPOST JSON to this webhook:\n\n- clip_id, video_url (public HTTPS mp4)\n- title, description, hashtags[]\n- platforms[]: any of youtube | instagram | tiktok_manual\n- ig_user_id (IG Business account ID)\n- yt_category_id (20=Gaming), yt_privacy\n- operator_email\n- compliance_passed: MUST be true — set only by the producer\'s Compliance gate\n\nProducer: Claude Code session (agentic-clipper repo). Cadence: 4 clips/day.',
-  [clipWebhook, normalize],
-  { color: 4 }
-);
+const contractNoteText = '## Clip Poster - payload contract\n' +
+  '\n' +
+  'POST JSON to this webhook:\n' +
+  '\n' +
+  '- clip_id, video_url (public HTTPS mp4)\n' +
+  '- title, description, hashtags[]\n' +
+  '- platforms[]: any of youtube | instagram | tiktok_manual\n' +
+  '- ig_user_id (IG Business account ID)\n' +
+  '- yt_category_id (20=Gaming), yt_privacy\n' +
+  '- operator_email\n' +
+  '- compliance_passed: MUST be true - set only by the producers Compliance gate\n' +
+  '\n' +
+  'Producer: Claude Code session (agentic-clipper repo). Cadence: 4 clips/day.';
 
-const setupNote = sticky(
-  '## One-time credential setup\n\n1. **YouTube account** (youTubeOAuth2Api): Google Cloud project with YouTube Data API v3 enabled, OAuth client, connect on the Upload YouTube Short node.\n2. **Facebook Graph account** (facebookGraphApi): long-lived Page access token with instagram_basic + instagram_content_publish, IG account must be Business/Creator linked to the FB Page.\n3. Outlook is already connected (TikTok manual emails + block alerts).',
-  [uploadYouTubeShort, igPublishReel],
-  { color: 5 }
-);
+const contractNote = sticky(contractNoteText, [clipWebhook, normalize], { color: 4 });
 
-export default workflow('clip-poster', 'Clip Poster — Autonomous Publishing Rail')
+const setupNoteText = '## One-time credential setup\n' +
+  '\n' +
+  '1. YouTube account (youTubeOAuth2Api): Google Cloud project with YouTube Data API v3 enabled, OAuth client, connect on the Upload YouTube Short node.\n' +
+  '2. Facebook Graph account (facebookGraphApi): long-lived Page access token with instagram_basic + instagram_content_publish, IG account must be Business/Creator linked to the FB Page.\n' +
+  '3. Outlook is already connected (TikTok manual emails + block alerts).';
+
+const setupNote = sticky(setupNoteText, [uploadYouTubeShort, igPublishReel], { color: 5 });
+
+export default workflow('clip-poster', 'Clip Poster - Autonomous Publishing Rail')
   .add(clipWebhook)
   .to(normalize)
   .to(complianceGate

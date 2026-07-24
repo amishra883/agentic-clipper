@@ -7,12 +7,16 @@ platform posts on its own infrastructure.
 
 ## Workflow: `clip-poster` (Clip Poster — Autonomous Publishing Rail)
 
-Source: `clip_poster.workflow.js` (n8n Workflow SDK script, validated 19 nodes).
+Source: `clip_poster.workflow.js` (n8n Workflow SDK script, 19 nodes).
 
-Deployment status: **validated but NOT yet created** — the n8n MCP connector
-disconnected mid-deploy on 2026-07-06. To deploy: reconnect the n8n connector
-in the Claude session and ask Claude to "deploy the clip-poster n8n workflow
-from automation/n8n/clip_poster.workflow.js", then publish it.
+Deployment status (2026-07-24): **created in n8n, NOT yet published/active.**
+- Workflow ID: `TnlCXeaNuWFWMCEl`
+- URL: https://mishramedicalsolutions.app.n8n.cloud/workflow/TnlCXeaNuWFWMCEl
+- Publish (activation) was intentionally not auto-applied — publishing makes
+  the webhook live and would attempt real posts/emails on the next payload,
+  and two of three platform credentials (YouTube, Facebook Graph) aren't
+  connected yet. Publish it manually in the n8n editor (top-right toggle),
+  or ask Claude to publish it once you're ready to go live.
 
 ## What it does
 

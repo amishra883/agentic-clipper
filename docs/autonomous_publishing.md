@@ -57,7 +57,7 @@ durable and auditable in its execution log.
 | Zapier TikTok | no organic posting app exists | Confirms manual mode for TikTok |
 | Zapier | **rejected by operator** — n8n chosen | Posting rail lives in n8n |
 | n8n credentials | Outlook ✅ / YouTube ❌ / Facebook Graph ❌ | Two OAuth setups pending (see automation/n8n/README.md) |
-| n8n workflow | validated (19 nodes), deploy interrupted by connector drop | Re-deploy from `automation/n8n/clip_poster.workflow.js` |
+| n8n workflow | **created** 2026-07-24 (id `TnlCXeaNuWFWMCEl`, 19 nodes), **not published** | Publish once YouTube + Facebook Graph credentials are connected — see Go-live checklist |
 
 Budget note: the Higgsfield subscription must fit inside the $240/mo cap
 (`config/budget.yaml`). It largely *replaces* the budgeted Seedance +
@@ -83,8 +83,9 @@ Operator steps (one-time, ~30–45 min total):
    Facebook Page, create long-lived Page token with `instagram_basic` +
    `instagram_content_publish`, add as `Facebook Graph account` in n8n; note
    the IG user ID.
-6. **Deploy the rail**: ask Claude to deploy + publish
-   `automation/n8n/clip_poster.workflow.js`.
+6. **Publish the rail**: the workflow is already created in n8n (id
+   `TnlCXeaNuWFWMCEl`, not yet published). Once steps 4–5 are done, publish it
+   from the n8n editor or ask Claude to publish it.
 
 Claude steps (after 1–6):
 
